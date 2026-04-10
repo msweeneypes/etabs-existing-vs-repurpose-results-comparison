@@ -1,0 +1,13 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "VIKTOR",
+			"type": "shell",
+			"command": "viktor-cli start",
+			"runOptions": {
+				"runOn": "folderOpen"
+			}
+		}
+	]
+}
