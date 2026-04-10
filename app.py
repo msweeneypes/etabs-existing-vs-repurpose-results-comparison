@@ -1,9 +1,200 @@
 import viktor as vkt
 
+from comparison import parse_combo_names, run_comparison, results_to_csv
+
+COLUMN_HEADERS = [
+    'MemberType', 'Story', 'Frame', 'Station',
+    'OutputCase', 'Component',
+    'ExistingValue', 'ModifiedValue', 'PctChange', 'Pass',
+]
+
+
+# ---------------------------------------------------------------------------
+# Dynamic options callback — populates MultiSelectField from uploaded file
+# ---------------------------------------------------------------------------
+
+def get_combo_options(params, **kwargs):
+    if not params.step1.existing_file:
+        return []
+    try:
+        return parse_combo_names(params.step1.existing_file.file)
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Step 1 validation — both files must be uploaded before proceeding
+# ---------------------------------------------------------------------------
+
+def validate_step1(params, **kwargs):
+    violations = []
+    if not params.step1.existing_file:
+        violations.append(
+            vkt.InputViolation(
+                'Please upload the existing model file',
+                fields=['step1.existing_file'],
+            )
+        )
+    if not params.step1.modified_file:
+        violations.append(
+            vkt.InputViolation(
+                'Please upload the modified model file',
+                fields=['step1.modified_file'],
+            )
+        )
+    if violations:
+        raise vkt.UserError(
+            'Both ETABS export files must be uploaded before proceeding.',
+            input_violations=violations,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Parametrization
+# ---------------------------------------------------------------------------
 
 class Parametrization(vkt.Parametrization):
-    pass # Welcome to VIKTOR! You can add your input fields here. Happy Coding!
 
+    # -- Step 1: File Upload -------------------------------------------------
+    step1 = vkt.Step('Upload Files', on_next=validate_step1)
+
+    step1.intro = vkt.Text("""
+## Upload ETABS Exports
+
+Upload two ETABS Excel exports (.xlsx) — one for the **existing** model and one
+for the **modified** (repurposed) model.
+
+Each file should contain sheets named:
+- *Element Forces - Columns*
+- *Element Forces - Beams*
+- *Element Forces - Braces*
+- *Load Combination Definitions*
+""")
+
+    step1.existing_file = vkt.FileField(
+        'Existing Model (.xlsx)',
+        file_types=['.xlsx'],
+        description='ETABS export for the pre-modification model',
+    )
+    step1.modified_file = vkt.FileField(
+        'Modified Model (.xlsx)',
+        file_types=['.xlsx'],
+        description='ETABS export for the modified / repurposed model',
+    )
+
+    # -- Step 2: Configure & Compare -----------------------------------------
+    step2 = vkt.Step('Configure & Compare', views=['results_table'])
+
+    step2.section_combos = vkt.Section('Load Combinations')
+    step2.section_combos.load_combos = vkt.MultiSelectField(
+        'Select Load Combinations',
+        options=get_combo_options,
+        description='Populated from the existing model file. Select all combinations to include.',
+    )
+
+    step2.section_options = vkt.Section('Comparison Options')
+    step2.section_options.member_type = vkt.OptionField(
+        'Member Type',
+        options=['All', 'Columns', 'Beams', 'Braces'],
+        default='All',
+    )
+    step2.section_options.gravity_threshold = vkt.NumberField(
+        'Gravity Load Threshold (%)',
+        default=5,
+        min=0,
+        description='Maximum allowable % increase for gravity load combinations (IBC 3403)',
+    )
+    step2.section_options.lateral_threshold = vkt.NumberField(
+        'Lateral Load Threshold (%)',
+        default=10,
+        min=0,
+        description='Maximum allowable % increase for lateral load combinations (IBC 3403)',
+    )
+    step2.section_options.display_filter = vkt.OptionField(
+        'Display Filter',
+        options=['All Results', 'Failures Only'],
+        default='All Results',
+    )
+
+    step2.section_export = vkt.Section('Export')
+    step2.section_export.download_btn = vkt.DownloadButton(
+        'Export Results to CSV',
+        method='download_csv',
+        longpoll=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Controller
+# ---------------------------------------------------------------------------
 
 class Controller(vkt.Controller):
     parametrization = Parametrization
+
+    @vkt.TableView('Comparison Results', duration_guess=15)
+    def results_table(self, params, **kwargs):
+        if not params.step1.existing_file or not params.step1.modified_file:
+            raise vkt.UserError('Please upload both model files in Step 1.')
+
+        load_combos = params.step2.section_combos.load_combos
+        if not load_combos:
+            raise vkt.UserError('Please select at least one load combination.')
+
+        results = self._run(params)
+
+        if not results:
+            return vkt.TableResult(
+                [['-'] * len(COLUMN_HEADERS)],
+                column_headers=COLUMN_HEADERS,
+            )
+
+        data = []
+        for row in results:
+            is_pass = (row['Pass'] == 'PASS')
+            pass_cell = vkt.TableCell(
+                row['Pass'],
+                background_color=vkt.Color(34, 139, 34) if is_pass else vkt.Color(178, 34, 34),
+                text_color=vkt.Color(255, 255, 255),
+            )
+            data.append([
+                row['MemberType'],
+                row['Story'],
+                row['Frame'],
+                row['Station'],
+                row['OutputCase'],
+                row['Component'],
+                row['ExistingValue'],
+                row['ModifiedValue'],
+                row['PctChange'],
+                pass_cell,
+            ])
+
+        return vkt.TableResult(data, column_headers=COLUMN_HEADERS)
+
+    def download_csv(self, params, **kwargs):
+        if not params.step1.existing_file or not params.step1.modified_file:
+            raise vkt.UserError('Please upload both model files in Step 1.')
+
+        load_combos = params.step2.section_combos.load_combos
+        if not load_combos:
+            raise vkt.UserError('Please select at least one load combination.')
+
+        results = self._run(params)
+        csv_string = results_to_csv(results)
+        return vkt.DownloadResult(csv_string, 'etabs_comparison_results.csv')
+
+    # -------------------------------------------------------------------------
+    # Shared helper — extracts params and calls run_comparison
+    # -------------------------------------------------------------------------
+
+    def _run(self, params):
+        p = params.step2.section_options
+        return run_comparison(
+            existing_file=params.step1.existing_file.file,
+            modified_file=params.step1.modified_file.file,
+            selected_combos=list(params.step2.section_combos.load_combos),
+            member_type_filter=p.member_type or 'All',
+            gravity_threshold=float(p.gravity_threshold or 5),
+            lateral_threshold=float(p.lateral_threshold or 10),
+            show_failures_only=(p.display_filter == 'Failures Only'),
+        )

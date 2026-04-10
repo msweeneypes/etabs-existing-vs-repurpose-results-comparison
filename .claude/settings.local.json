@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -lh /c/Users/msweeney/viktor-apps/etabs-existing-vs-repurpose-results-comparison/*.xlsx)",
+      "Bash(python3 -c ':*)",
+      "Bash(python -c ':*)",
+      "Bash(/c/Users/msweeney/viktor-apps/etabs-existing-vs-repurpose-results-comparison/venv/Scripts/python.exe -c ':*)",
+      "Bash(/c/Users/msweeney/viktor-apps/etabs-existing-vs-repurpose-results-comparison/venv/Scripts/pip.exe install:*)"
+    ]
+  }
+}
