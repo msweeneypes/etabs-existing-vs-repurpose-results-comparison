@@ -87,9 +87,9 @@ Each file should contain sheets named:
 
     step2.section_combos = vkt.Section('Load Combinations')
     step2.section_combos.load_combos = vkt.MultiSelectField(
-        'Select Load Combinations',
+        'Filter Load Combinations (optional)',
         options=get_combo_options,
-        description='Populated from the existing model file. Select all combinations to include.',
+        description='Leave empty to compare ALL combinations. Select specific ones to narrow the scope.',
     )
 
     step2.section_options = vkt.Section('Comparison Options')
@@ -113,7 +113,7 @@ Each file should contain sheets named:
     step2.section_options.display_filter = vkt.OptionField(
         'Display Filter',
         options=['All Results', 'Failures Only'],
-        default='All Results',
+        default='Failures Only',
     )
 
     step2.section_export = vkt.Section('Export')
@@ -135,10 +135,6 @@ class Controller(vkt.Controller):
     def results_table(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
-
-        load_combos = params.step2.section_combos.load_combos
-        if not load_combos:
-            raise vkt.UserError('Please select at least one load combination.')
 
         results = self._run(params)
 
@@ -175,10 +171,6 @@ class Controller(vkt.Controller):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
 
-        load_combos = params.step2.section_combos.load_combos
-        if not load_combos:
-            raise vkt.UserError('Please select at least one load combination.')
-
         results = self._run(params)
         csv_string = results_to_csv(results)
         return vkt.DownloadResult(csv_string, 'etabs_comparison_results.csv')
@@ -189,10 +181,11 @@ class Controller(vkt.Controller):
 
     def _run(self, params):
         p = params.step2.section_options
+        selected = list(params.step2.section_combos.load_combos or [])
         return run_comparison(
             existing_file=params.step1.existing_file.file,
             modified_file=params.step1.modified_file.file,
-            selected_combos=list(params.step2.section_combos.load_combos),
+            selected_combos=selected if selected else None,
             member_type_filter=p.member_type or 'All',
             gravity_threshold=float(p.gravity_threshold or 5),
             lateral_threshold=float(p.lateral_threshold or 10),

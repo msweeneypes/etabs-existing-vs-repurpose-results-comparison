@@ -107,7 +107,7 @@ def classify_combo(combo_name: str) -> str:
 def run_comparison(
     existing_file,
     modified_file,
-    selected_combos: list,
+    selected_combos,          # list of str, or None to use all combos
     member_type_filter: str,
     gravity_threshold: float,
     lateral_threshold: float,
@@ -118,12 +118,19 @@ def run_comparison(
     Returns a list of row dicts with keys:
     MemberType, Story, Frame, Station, OutputCase, Component,
     ExistingValue, ModifiedValue, PctChange, Pass
+
+    If selected_combos is None or empty, all combinations found in the
+    existing file are used automatically.
     """
     types_to_process = (
         ['Columns', 'Beams', 'Braces']
         if member_type_filter == 'All'
         else [member_type_filter]
     )
+
+    # Auto-discover combos when none are specified
+    if not selected_combos:
+        selected_combos = parse_combo_names(existing_file)
 
     # Pre-classify each combo once
     combo_class = {c: classify_combo(c) for c in selected_combos}
