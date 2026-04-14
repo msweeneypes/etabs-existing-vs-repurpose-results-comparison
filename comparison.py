@@ -1,7 +1,23 @@
 import io
+import logging
 import re
+import sys
 
 import pandas as pd
+
+# openpyxl can write warning messages that contain Unicode characters from the
+# workbook (sheet names, cell values, etc.).  On Windows the default sys.stdout
+# encoding is cp1252, which cannot represent many Unicode code-points, causing
+# a UnicodeEncodeError before the file is even read.  Reconfigure the streams
+# to UTF-8 and silence openpyxl's logger so nothing escapes to the terminal.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, 'reconfigure'):
+        try:
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            pass
+
+logging.getLogger('openpyxl').setLevel(logging.CRITICAL)
 
 FORCE_COMPONENTS = ['P', 'V2', 'V3', 'T', 'M2', 'M3']
 
@@ -39,14 +55,15 @@ def parse_force_sheet(file_obj, member_type: str) -> pd.DataFrame:
     label_col = MEMBER_LABEL_COL[member_type]
 
     try:
-        with file_obj.open() as f:
-            df = pd.read_excel(
-                f,
-                sheet_name=sheet_name,
-                header=1,      # row index 1 (0-based) is the column header row
-                skiprows=[2],  # row index 2 is the units row — drop it
-                engine='openpyxl',
-            )
+        with file_obj.open() as fh:
+            file_bytes = fh.read()
+        df = pd.read_excel(
+            io.BytesIO(file_bytes),
+            sheet_name=sheet_name,
+            header=1,      # row index 1 (0-based) is the column header row
+            skiprows=[2],  # row index 2 is the units row — drop it
+            engine='openpyxl',
+        )
     except Exception:
         return pd.DataFrame(columns=EMPTY_COLS)
 
@@ -84,19 +101,33 @@ def parse_combo_names(file_obj) -> list:
 
     Returns an empty list if the sheet is missing or unreadable.
     """
-    try:
-        with file_obj.open() as f:
+    sheet_candidates = [
+        'Load Combination Definitions',
+        'Load Combinations',
+        'Combo Definitions',
+    ]
+    col_candidates = ['Name', 'Load Combination', 'Combo Name', 'Combination']
+
+    for sheet in sheet_candidates:
+        try:
+            with file_obj.open() as fh:
+                file_bytes = fh.read()
             df = pd.read_excel(
-                f,
-                sheet_name='Load Combination Definitions',
+                io.BytesIO(file_bytes),
+                sheet_name=sheet,
                 header=1,
                 skiprows=[2],
-                usecols=['Name'],
                 engine='openpyxl',
             )
-        return sorted(df['Name'].dropna().unique().tolist())
-    except Exception:
-        return []
+            # Try known column names, then fall back to the first column
+            for col in col_candidates:
+                if col in df.columns:
+                    return sorted(df[col].dropna().unique().tolist())
+            if not df.empty:
+                return sorted(df.iloc[:, 0].dropna().unique().tolist())
+        except Exception:
+            continue
+    return []
 
 
 def classify_combo(combo_name: str) -> str:
@@ -134,7 +165,8 @@ def run_comparison(
 
     # Pre-classify each combo once
     combo_class = {c: classify_combo(c) for c in selected_combos}
-    selected_set = set(selected_combos)
+    # None means "no filter" — used when combo discovery failed or nothing was selected
+    selected_set = set(selected_combos) if selected_combos else None
 
     all_results = []
 
@@ -142,9 +174,10 @@ def run_comparison(
         df_exist = parse_force_sheet(existing_file, mtype)
         df_mod   = parse_force_sheet(modified_file, mtype)
 
-        # Filter to only selected combos
-        df_exist = df_exist[df_exist['OutputCase'].isin(selected_set)]
-        df_mod   = df_mod[df_mod['OutputCase'].isin(selected_set)]
+        # Filter to only selected combos (skip filter if none were discovered)
+        if selected_set:
+            df_exist = df_exist[df_exist['OutputCase'].isin(selected_set)]
+            df_mod   = df_mod[df_mod['OutputCase'].isin(selected_set)]
 
         if df_mod.empty:
             continue
@@ -183,9 +216,12 @@ def run_comparison(
 
         near_zero = 1e-6
 
-        # Determine thresholds per row based on combo classification
+        # Determine thresholds per row based on combo classification.
+        # Fall back to classify_combo directly if combo_class wasn't pre-populated.
         thresholds = rows['OutputCase'].map(
-            lambda c: lateral_threshold if combo_class.get(c) == 'lateral' else gravity_threshold
+            lambda c: lateral_threshold
+            if (combo_class.get(c) or classify_combo(c)) == 'lateral'
+            else gravity_threshold
         )
 
         # Build pct_change and pass columns

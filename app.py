@@ -1,3 +1,6 @@
+import io
+
+import pandas as pd
 import viktor as vkt
 
 from comparison import parse_combo_names, run_comparison, results_to_csv
@@ -139,10 +142,35 @@ class Controller(vkt.Controller):
         results = self._run(params)
 
         if not results:
-            return vkt.TableResult(
-                [['-'] * len(COLUMN_HEADERS)],
-                column_headers=COLUMN_HEADERS,
-            )
+            # --- Temporary diagnostics: show what's in the file ---
+            diag = ['No results returned. Diagnostic info:']
+            for label, ff in [('EXISTING', params.step1.existing_file),
+                               ('MODIFIED', params.step1.modified_file)]:
+                if not ff:
+                    diag.append(f'{label}: not uploaded')
+                    continue
+                try:
+                    with ff.file.open() as fh:
+                        file_bytes = fh.read()
+                    xl = pd.ExcelFile(io.BytesIO(file_bytes), engine='openpyxl')
+                    sheet_names = xl.sheet_names
+                    safe_names = [s.encode('ascii', errors='replace').decode('ascii')
+                                  for s in sheet_names]
+                    diag.append(f'{label} sheets: {safe_names}')
+                    for sheet in sheet_names:
+                        raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet,
+                                            header=None, nrows=4, engine='openpyxl')
+                        safe_cols = [str(c).encode('ascii', errors='replace').decode('ascii')
+                                     for c in raw.iloc[1].tolist()]
+                        safe_sheet = sheet.encode('ascii', errors='replace').decode('ascii')
+                        diag.append(f'  "{safe_sheet}" row1: {safe_cols}')
+                except Exception as e:
+                    diag.append(f'{label} error: {e}')
+            from comparison import parse_combo_names
+            combos = parse_combo_names(params.step1.existing_file.file)
+            diag.append(f'Combos discovered ({len(combos)}): {combos[:5]}')
+            raise vkt.UserError('\n'.join(diag))
+            # --- End diagnostics ---
 
         data = []
         for row in results:
