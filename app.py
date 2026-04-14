@@ -1,5 +1,3 @@
-import io
-
 import pandas as pd
 import viktor as vkt
 
@@ -150,16 +148,16 @@ class Controller(vkt.Controller):
                     diag.append(f'{label}: not uploaded')
                     continue
                 try:
-                    with ff.file.open() as fh:
-                        file_bytes = fh.read()
-                    xl = pd.ExcelFile(io.BytesIO(file_bytes), engine='openpyxl')
-                    sheet_names = xl.sheet_names
+                    with ff.file.open_binary() as f:
+                        xl = pd.ExcelFile(f, engine='openpyxl')
+                        sheet_names = xl.sheet_names
                     safe_names = [s.encode('ascii', errors='replace').decode('ascii')
                                   for s in sheet_names]
                     diag.append(f'{label} sheets: {safe_names}')
                     for sheet in sheet_names:
-                        raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet,
-                                            header=None, nrows=4, engine='openpyxl')
+                        with ff.file.open_binary() as f2:
+                            raw = pd.read_excel(f2, sheet_name=sheet,
+                                                header=None, nrows=4, engine='openpyxl')
                         safe_cols = [str(c).encode('ascii', errors='replace').decode('ascii')
                                      for c in raw.iloc[1].tolist()]
                         safe_sheet = sheet.encode('ascii', errors='replace').decode('ascii')

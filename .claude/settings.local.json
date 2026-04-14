@@ -5,7 +5,10 @@
       "Bash(python3 -c ':*)",
       "Bash(python -c ':*)",
       "Bash(/c/Users/msweeney/viktor-apps/etabs-existing-vs-repurpose-results-comparison/venv/Scripts/python.exe -c ':*)",
-      "Bash(/c/Users/msweeney/viktor-apps/etabs-existing-vs-repurpose-results-comparison/venv/Scripts/pip.exe install:*)"
+      "Bash(/c/Users/msweeney/viktor-apps/etabs-existing-vs-repurpose-results-comparison/venv/Scripts/pip.exe install:*)",
+      "WebFetch(domain:docs.viktor.ai)",
+      "Bash(curl -s https://docs.viktor.ai/llms-full.txt)",
+      "Bash(awk '/^## File\\\\[/,/^## [A-Z]/')"
     ]
   }
 }

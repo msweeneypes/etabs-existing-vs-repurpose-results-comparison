@@ -1,23 +1,6 @@
-import io
-import logging
 import re
-import sys
 
 import pandas as pd
-
-# openpyxl can write warning messages that contain Unicode characters from the
-# workbook (sheet names, cell values, etc.).  On Windows the default sys.stdout
-# encoding is cp1252, which cannot represent many Unicode code-points, causing
-# a UnicodeEncodeError before the file is even read.  Reconfigure the streams
-# to UTF-8 and silence openpyxl's logger so nothing escapes to the terminal.
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, 'reconfigure'):
-        try:
-            _stream.reconfigure(encoding='utf-8', errors='replace')
-        except Exception:
-            pass
-
-logging.getLogger('openpyxl').setLevel(logging.CRITICAL)
 
 FORCE_COMPONENTS = ['P', 'V2', 'V3', 'T', 'M2', 'M3']
 
@@ -55,15 +38,14 @@ def parse_force_sheet(file_obj, member_type: str) -> pd.DataFrame:
     label_col = MEMBER_LABEL_COL[member_type]
 
     try:
-        with file_obj.open() as fh:
-            file_bytes = fh.read()
-        df = pd.read_excel(
-            io.BytesIO(file_bytes),
-            sheet_name=sheet_name,
-            header=1,      # row index 1 (0-based) is the column header row
-            skiprows=[2],  # row index 2 is the units row — drop it
-            engine='openpyxl',
-        )
+        with file_obj.open_binary() as f:
+            df = pd.read_excel(
+                f,
+                sheet_name=sheet_name,
+                header=1,      # row index 1 (0-based) is the column header row
+                skiprows=[2],  # row index 2 is the units row — drop it
+                engine='openpyxl',
+            )
     except Exception:
         return pd.DataFrame(columns=EMPTY_COLS)
 
@@ -110,15 +92,14 @@ def parse_combo_names(file_obj) -> list:
 
     for sheet in sheet_candidates:
         try:
-            with file_obj.open() as fh:
-                file_bytes = fh.read()
-            df = pd.read_excel(
-                io.BytesIO(file_bytes),
-                sheet_name=sheet,
-                header=1,
-                skiprows=[2],
-                engine='openpyxl',
-            )
+            with file_obj.open_binary() as f:
+                df = pd.read_excel(
+                    f,
+                    sheet_name=sheet,
+                    header=1,
+                    skiprows=[2],
+                    engine='openpyxl',
+                )
             # Try known column names, then fall back to the first column
             for col in col_candidates:
                 if col in df.columns:
