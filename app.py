@@ -127,15 +127,18 @@ class Parametrization(vkt.Parametrization):
 ## Upload ETABS Design Output Exports
 
 Upload two ETABS Excel exports (.xlsx) — one for the **existing** model and
-one for the **modified** model.
+one for the **modified** (repurposed) model.
 
-Each file must contain:
-- *Design Forces - Columns / Beams / Braces* — governing forces per member
-- *Stl Frm Sum - AISC 360-16* — D/C ratios and governing combo names
+**How to export from ETABS:**
+1. Run the steel frame design for both models.
+2. Go to *Display > Show Tables*, select **Design** tables.
+3. Export: *Design Forces - Columns*, *Design Forces - Beams*,
+   *Design Forces - Braces*, and *Steel Frame Design Summary - AISC 360-16*
+   to a single Excel workbook.
 
-Forces are compared using the **maximum absolute value across all design
-combos and stations** for each force component. IBC 3403 thresholds are
-applied based on whether the governing combo is gravity or lateral.
+Each file must contain those four sheets. The first run will take
+~1–2 minutes to parse the data; subsequent tab switches and threshold
+changes will be near-instant.
 """)
 
     step1.existing_file = vkt.FileField(
@@ -156,6 +159,51 @@ applied based on whether the governing combo is gravity or lateral.
         'summary_table',
         'key_metrics',
     ])
+
+    step2.intro_method = vkt.Text("""
+## How This Comparison Works
+
+This tool compares structural demand on every steel member between the **existing** and **modified** models to check compliance with **IBC Section 3403**, which governs force increases in members of existing buildings being modified or repurposed.
+
+For each matched member the tool finds the **worst-case force across all ETABS design load combinations and stations**, then computes the percent change in magnitude as (abs(new) - abs(exist)) / abs(exist) x 100. Using absolute values ensures a sign reversal (tension flipping to compression) does not artificially inflate the percentage. Sign reversals are flagged separately in the Sign Rev. column.
+""")
+
+    step2.intro_columns = vkt.Text("""
+### What the columns mean
+
+**P** - Axial force (kip). Positive = tension, negative = compression.
+
+**V2 / V3** - Shear in the local 2- and 3-axis directions (kip).
+
+**T** - Torsion (kip-ft).
+
+**M2 / M3** - Minor- and major-axis bending moments (kip-ft).
+
+**PMM** - P-M-M interaction ratio. This is the AISC 360-16 Equation H1-1 combined demand/capacity (D/C) ratio for axial force plus biaxial bending acting together. A value of 1.0 means the member is exactly at capacity. Values above 1.0 mean the member is overstressed. This is the primary design check for columns and braces.
+
+**V Major** - Major-axis shear D/C ratio from the ETABS Steel Frame Design Summary.
+
+**Worst Force %** - The largest percent increase among P, V2, V3, T, M2, M3 for that member.
+
+**Fail Reason** - Plain-English description of what caused the FAIL flag, e.g. "M3 +23.5% > 5% gravity".
+""")
+
+    step2.intro_thresholds = vkt.Text("""
+### Pass / Fail and Load Classification (IBC 3403)
+
+A member is flagged **FAIL** if any force component or D/C ratio increases by more than the threshold for its governing load type:
+
+- **Gravity combos** (dead, live, snow, roof live) - default 5% increase triggers a flag
+- **Lateral combos** (wind, seismic) - default 10% increase triggers a flag
+
+Load type is determined from the governing combo name in the **modified** model. Combos with wind tokens (WA, WB, WG) or seismic tokens (EQ, EQB) in the name are classified as lateral; all others are gravity. Thresholds can be adjusted in the Comparison Options below.
+
+**ADDED** means the member exists in the modified model but not the existing model. No threshold check is applied.
+
+**REMOVED** means the member exists in the existing model but not the modified model.
+
+Start with the **Overview** tab to spot failures quickly. Use **Full Detail** to see all six force components. The **Results Chart** shows the breakdown by story at a glance.
+""")
 
     step2.section_options = vkt.Section('Comparison Options')
     step2.section_options.member_type = vkt.OptionField(
