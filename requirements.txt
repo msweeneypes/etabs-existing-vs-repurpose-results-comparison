@@ -1,3 +1,4 @@
 viktor==14.29.0
 pandas>=2.0
 openpyxl>=3.1
+plotly>=5.0

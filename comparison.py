@@ -3,8 +3,14 @@ Comparison engine for ETABS Design Output Tables.
 
 Parses Design Forces and Steel Frame Design Summary sheets from two Excel
 exports and produces a member-level force and D/C ratio comparison table.
+
+Performance: parsed DataFrames and comparison results are cached in
+module-level dicts keyed on MD5 hash of file content, so re-running with
+different thresholds or display filters is near-instant after the first parse.
 """
+import hashlib
 import re
+from collections import defaultdict
 
 import pandas as pd
 
@@ -39,10 +45,26 @@ LATERAL_RE = re.compile(r'(?<![A-Za-z])([EW][A-Za-z]+)(?![A-Za-z])')
 
 
 # ---------------------------------------------------------------------------
+# Module-level caches
+# ---------------------------------------------------------------------------
+
+# file_hash → {'summary': DataFrame, 'forces': {'Columns': df, 'Beams': df, 'Braces': df}}
+_PARSE_CACHE: dict = {}
+
+# (exist_hash, new_hash, member_type_filter, gravity_threshold, lateral_threshold) → list[dict]
+_RESULTS_CACHE: dict = {}
+
+
+# ---------------------------------------------------------------------------
 # Low-level helpers
 # ---------------------------------------------------------------------------
 
-def _read_etabs_sheet(file_obj, sheet_name: str) -> pd.DataFrame:
+def _file_hash(file_obj) -> str:
+    """Return MD5 hex digest of the file content."""
+    return hashlib.md5(file_obj.getvalue_binary()).hexdigest()
+
+
+def _read_etabs_sheet(file_obj, sheet_name: str, usecols=None) -> pd.DataFrame:
     """
     Read one ETABS-exported sheet.
 
@@ -55,9 +77,10 @@ def _read_etabs_sheet(file_obj, sheet_name: str) -> pd.DataFrame:
             df = pd.read_excel(
                 f,
                 sheet_name=sheet_name,
-                header=1,      # row 1 = headers
-                skiprows=[2],  # row 2 = units — drop
+                header=1,       # row 1 = headers
+                skiprows=[2],   # row 2 = units — drop
                 engine='openpyxl',
+                usecols=usecols,
             )
         return df
     except Exception:
@@ -87,7 +110,10 @@ def parse_design_forces(file_obj, member_type: str) -> pd.DataFrame:
     sheet = DESIGN_FORCES_SHEETS[member_type]
     label_col = LABEL_COL[member_type]
 
-    df = _read_etabs_sheet(file_obj, sheet)
+    # Only read the columns we actually need — skip UniqueName, Combo, Station
+    needed_cols = {'Story', label_col} | set(FORCE_COMPONENTS)
+    df = _read_etabs_sheet(file_obj, sheet, usecols=lambda col: col in needed_cols)
+
     empty = pd.DataFrame(columns=['Story', 'Label'] + FORCE_COMPONENTS)
 
     if df.empty or label_col not in df.columns:
@@ -160,6 +186,28 @@ def parse_design_summary(file_obj) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Cache helpers
+# ---------------------------------------------------------------------------
+
+def _get_parsed_file(file_obj) -> dict:
+    """
+    Return pre-parsed DataFrames for a file, computing and caching if absent.
+
+    Returns {'summary': df, 'forces': {'Columns': df, 'Beams': df, 'Braces': df}}
+    """
+    h = _file_hash(file_obj)
+    if h not in _PARSE_CACHE:
+        _PARSE_CACHE[h] = {
+            'summary': parse_design_summary(file_obj),
+            'forces': {
+                mt: parse_design_forces(file_obj, mt)
+                for mt in ('Columns', 'Beams', 'Braces')
+            },
+        }
+    return _PARSE_CACHE[h]
+
+
+# ---------------------------------------------------------------------------
 # Classification
 # ---------------------------------------------------------------------------
 
@@ -212,27 +260,60 @@ def _fmt(val, decimals=3):
 
 
 # ---------------------------------------------------------------------------
-# Main comparison
+# Fail reason helper
 # ---------------------------------------------------------------------------
 
-def run_comparison(
-    existing_file,
-    modified_file,
+def _compute_fail_reason(row: dict, threshold: float, load_type: str,
+                          any_sign_rev: bool, is_fail: bool) -> str:
+    """
+    Build a human-readable string describing the primary cause of a FAIL.
+
+    Returns '' for passing or non-comparable rows.
+    """
+    if not is_fail:
+        return ''
+
+    # Priority 1: any force component jumped from ~zero (INF change)
+    for c in FORCE_COMPONENTS:
+        if row.get(f'{c}_Pct') == 'INF':
+            return f'{c} INF ({load_type})'
+    if row.get('PMM_Pct') == 'INF':
+        return f'PMM INF ({load_type})'
+
+    # Priority 2: largest % overage across forces and PMM
+    worst_label = None
+    worst_pct = 0.0
+    for c in FORCE_COMPONENTS:
+        pct = row.get(f'{c}_Pct')
+        if isinstance(pct, float) and pct > threshold and pct > worst_pct:
+            worst_pct = pct
+            worst_label = c
+    pmm_pct = row.get('PMM_Pct')
+    if isinstance(pmm_pct, float) and pmm_pct > threshold and pmm_pct > worst_pct:
+        worst_pct = pmm_pct
+        worst_label = 'PMM'
+
+    if worst_label is not None:
+        sign_tag = ' [sign rev]' if any_sign_rev else ''
+        return f'{worst_label} +{worst_pct:.1f}% > {threshold:.0f}% {load_type}{sign_tag}'
+
+    return 'See detail'
+
+
+# ---------------------------------------------------------------------------
+# Internal comparison (no file I/O — works from pre-parsed dicts)
+# ---------------------------------------------------------------------------
+
+def _run_comparison_internal(
+    parsed_exist: dict,
+    parsed_new: dict,
     member_type_filter: str,
     gravity_threshold: float,
     lateral_threshold: float,
-    show_failures_only: bool,
 ) -> list:
     """
-    Compare ETABS design output between two models.
-
-    Returns a list of row dicts — one per matched (or unmatched) member.
-    Keys: Story, Label, MemberType, DesignSection_Exist, DesignSection_New,
-          GovCombo_Exist, GovCombo_New, LoadType,
-          P_Exist … M3_New … M3_Pct,
-          PMM_Exist, PMM_New, PMM_Pct,
-          VMaj_Exist, VMaj_New, VMaj_Pct,
-          SignReversal, Pass
+    Core comparison logic. Operates on pre-parsed DataFrames.
+    Returns the full unfiltered result list.
     """
     types_to_process = (
         ['Columns', 'Beams', 'Braces']
@@ -240,24 +321,26 @@ def run_comparison(
         else [member_type_filter]
     )
 
-    # Parse design summaries once (covers all member types)
-    sum_exist = parse_design_summary(existing_file)
-    sum_new   = parse_design_summary(modified_file)
+    sum_exist = parsed_exist['summary']
+    sum_new   = parsed_new['summary']
 
     all_results = []
 
     for mtype in types_to_process:
         design_type = DESIGN_TYPE[mtype]
 
-        # Filter summary to this member type
-        ds_exist = sum_exist[sum_exist['MemberType'] == design_type].copy() if 'MemberType' in sum_exist.columns else pd.DataFrame()
-        ds_new   = sum_new[sum_new['MemberType'] == design_type].copy()   if 'MemberType' in sum_new.columns   else pd.DataFrame()
+        ds_exist = (
+            sum_exist[sum_exist['MemberType'] == design_type].copy()
+            if 'MemberType' in sum_exist.columns else pd.DataFrame()
+        )
+        ds_new = (
+            sum_new[sum_new['MemberType'] == design_type].copy()
+            if 'MemberType' in sum_new.columns else pd.DataFrame()
+        )
 
-        # Parse forces
-        forces_exist = parse_design_forces(existing_file, mtype)
-        forces_new   = parse_design_forces(modified_file, mtype)
+        forces_exist = parsed_exist['forces'][mtype]
+        forces_new   = parsed_new['forces'][mtype]
 
-        # Build member sets from design summary (authoritative for membership)
         def _member_set(ds):
             if ds.empty or 'Story' not in ds.columns:
                 return set()
@@ -267,7 +350,6 @@ def run_comparison(
         new_members   = _member_set(ds_new)
         all_members   = exist_members | new_members
 
-        # Build lookup dicts: (story, label) → summary row
         def _build_lookup(ds):
             out = {}
             if ds.empty:
@@ -279,7 +361,6 @@ def run_comparison(
         exist_lookup = _build_lookup(ds_exist)
         new_lookup   = _build_lookup(ds_new)
 
-        # Build force lookup: (story, label) → forces row
         def _build_force_lookup(df):
             out = {}
             if df.empty:
@@ -306,7 +387,7 @@ def run_comparison(
                 'MemberType': design_type,
             }
 
-            # ---- REMOVED: exists only in existing model ----
+            # ---- REMOVED ----
             if not in_new:
                 row.update({
                     'DesignSection_Exist': es.get('DesignSection', '') if es is not None else '',
@@ -319,6 +400,7 @@ def run_comparison(
                     'VMaj_Exist': _fmt(es.get('VMajRatio')) if es is not None else 'N/A',
                     'VMaj_New': 'N/A', 'VMaj_Pct': 'N/A',
                     'SignReversal': '',
+                    'FailReason': '',
                     'Pass': 'REMOVED',
                 })
                 for c in FORCE_COMPONENTS:
@@ -328,7 +410,7 @@ def run_comparison(
                 all_results.append(row)
                 continue
 
-            # ---- ADDED: exists only in new model ----
+            # ---- ADDED ----
             if not in_exist:
                 row.update({
                     'DesignSection_Exist': 'N/A',
@@ -343,6 +425,7 @@ def run_comparison(
                     'VMaj_New': _fmt(ns.get('VMajRatio')) if ns is not None else 'N/A',
                     'VMaj_Pct': 'N/A',
                     'SignReversal': '',
+                    'FailReason': '',
                     'Pass': 'ADDED',
                 })
                 for c in FORCE_COMPONENTS:
@@ -352,7 +435,7 @@ def run_comparison(
                 all_results.append(row)
                 continue
 
-            # ---- MATCHED: in both models ----
+            # ---- MATCHED ----
             e_sec       = es.get('DesignSection', '') if es is not None else ''
             n_sec       = ns.get('DesignSection', '') if ns is not None else ''
             e_pmm_combo = es.get('PMMCombo', '')      if es is not None else ''
@@ -388,25 +471,12 @@ def run_comparison(
             row['VMaj_New']   = _fmt(n_vmaj) if n_vmaj is not None else 'N/A'
             row['VMaj_Pct']   = vmaj_pct
 
-            # Forces — flag if no design forces data
-            if ef is None:
-                row['_no_exist_forces'] = True
-            if nf is None:
-                row['_no_new_forces'] = True
-
             any_sign_rev = False
             is_fail = False
 
             for c in FORCE_COMPONENTS:
-                if ef is None:
-                    e_val = 'No Data'
-                else:
-                    e_val = _fmt(float(ef[c]), 2)
-
-                if nf is None:
-                    n_val = 'No Data'
-                else:
-                    n_val = _fmt(float(nf[c]), 2)
+                e_val = _fmt(float(ef[c]), 2) if ef is not None else 'No Data'
+                n_val = _fmt(float(nf[c]), 2) if nf is not None else 'No Data'
 
                 row[f'{c}_Exist'] = e_val
                 row[f'{c}_New']   = n_val
@@ -421,31 +491,67 @@ def run_comparison(
                 else:
                     row[f'{c}_Pct'] = 'N/A'
 
-            # Also check D/C increase
+            # D/C threshold check
             if pmm_pct == 'INF' or (isinstance(pmm_pct, float) and pmm_pct > threshold):
                 is_fail = True
 
             row['SignReversal'] = 'YES' if any_sign_rev else ''
-            row['Pass'] = 'FAIL' if is_fail else 'PASS'
-
-            # Clean up internal flags
-            row.pop('_no_exist_forces', None)
-            row.pop('_no_new_forces', None)
-
-            if show_failures_only and not is_fail:
-                continue
+            row['FailReason']   = _compute_fail_reason(row, threshold, load_type, any_sign_rev, is_fail)
+            row['Pass']         = 'FAIL' if is_fail else 'PASS'
 
             all_results.append(row)
 
     return all_results
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def run_comparison(
+    existing_file,
+    modified_file,
+    member_type_filter: str,
+    gravity_threshold: float,
+    lateral_threshold: float,
+    show_failures_only: bool,
+) -> list:
+    """
+    Compare ETABS design output between two models.
+
+    Returns a list of row dicts — one per matched (or unmatched) member.
+    Results are cached by file hash + comparison parameters; only file parsing
+    (on first upload) is slow.
+
+    Keys per row: Story, Label, MemberType, DesignSection_Exist/New,
+    GovCombo_Exist/New, LoadType, P/V2/V3/T/M2/M3_Exist/New/Pct,
+    PMM_Exist/New/Pct, VMaj_Exist/New/Pct, SignReversal, FailReason, Pass
+    """
+    exist_hash = _file_hash(existing_file)
+    new_hash   = _file_hash(modified_file)
+    cache_key  = (exist_hash, new_hash, member_type_filter,
+                  gravity_threshold, lateral_threshold)
+
+    if cache_key not in _RESULTS_CACHE:
+        parsed_exist = _get_parsed_file(existing_file)
+        parsed_new   = _get_parsed_file(modified_file)
+        _RESULTS_CACHE[cache_key] = _run_comparison_internal(
+            parsed_exist, parsed_new,
+            member_type_filter, gravity_threshold, lateral_threshold,
+        )
+
+    all_results = _RESULTS_CACHE[cache_key]
+
+    if show_failures_only:
+        return [r for r in all_results if r.get('Pass') == 'FAIL']
+    return list(all_results)
+
+
 def build_summary(results: list) -> list:
     """
     Group results by MemberType and Story; count PASS/FAIL/ADDED/REMOVED.
-    Returns list of row dicts with keys: Story, MemberType, Total, PASS, FAIL, ADDED, REMOVED.
+    Returns list of row dicts: Story, MemberType, Total, PASS, FAIL, ADDED, REMOVED.
     """
-    from collections import defaultdict
     counts = defaultdict(lambda: {'Total': 0, 'PASS': 0, 'FAIL': 0, 'ADDED': 0, 'REMOVED': 0})
 
     for r in results:

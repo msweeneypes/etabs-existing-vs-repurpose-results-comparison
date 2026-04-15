@@ -1,8 +1,25 @@
+import re
+
 import viktor as vkt
 
-from comparison import build_summary, results_to_csv, run_comparison
+from comparison import build_summary, results_to_csv, run_comparison, FORCE_COMPONENTS
 
-COLUMN_HEADERS = [
+# ---------------------------------------------------------------------------
+# Column headers
+# ---------------------------------------------------------------------------
+
+OVERVIEW_HEADERS = [
+    'Story', 'Label', 'Type',
+    'Section (Exist)', 'Section (New)',
+    'Load Type',
+    'PMM (Exist)', 'PMM (New)', 'PMM (%)',
+    'V Major (%)',
+    'Worst Force (%)',
+    'Fail Reason',
+    'Result',
+]
+
+DETAIL_HEADERS = [
     'Story', 'Label', 'Type',
     'Section (Exist)', 'Section (New)',
     'Gov Combo (Exist)', 'Gov Combo (New)', 'Load Type',
@@ -14,17 +31,65 @@ COLUMN_HEADERS = [
     'M3 (Exist)', 'M3 (New)', 'M3 (%)',
     'PMM (Exist)', 'PMM (New)', 'PMM (%)',
     'V Maj (Exist)', 'V Maj (New)', 'V Maj (%)',
-    'Sign Rev.', 'Result',
+    'Sign Rev.', 'Fail Reason', 'Result',
 ]
 
 SUMMARY_HEADERS = ['Story', 'Type', 'Total', 'PASS', 'FAIL', 'ADDED', 'REMOVED']
 
+# ---------------------------------------------------------------------------
+# Colors
+# ---------------------------------------------------------------------------
+
 _RESULT_COLORS = {
-    'PASS':    vkt.Color(34, 139, 34),   # green
-    'FAIL':    vkt.Color(178, 34, 34),   # red
-    'ADDED':   vkt.Color(30, 100, 200),  # blue
-    'REMOVED': vkt.Color(180, 100, 0),   # orange
+    'PASS':    vkt.Color(34, 139, 34),
+    'FAIL':    vkt.Color(178, 34, 34),
+    'ADDED':   vkt.Color(30, 100, 200),
+    'REMOVED': vkt.Color(180, 100, 0),
 }
+
+_CHART_COLORS = {
+    'FAIL':    '#B22222',
+    'PASS':    '#228B22',
+    'ADDED':   '#1E64C8',
+    'REMOVED': '#B46400',
+}
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def _result_cell(pass_val: str) -> vkt.TableCell:
+    color = _RESULT_COLORS.get(pass_val, vkt.Color(128, 128, 128))
+    return vkt.TableCell(pass_val, background_color=color,
+                         text_color=vkt.Color(255, 255, 255))
+
+
+def _fmt_pct(val) -> str:
+    """Format a percent change value for display with explicit sign."""
+    if isinstance(val, float):
+        sign = '+' if val >= 0 else ''
+        return f'{sign}{val:.1f}%'
+    return str(val)
+
+
+def _worst_force_pct(row: dict) -> str:
+    """Return the largest positive force % change across all components."""
+    vals = [
+        row.get(f'{c}_Pct') for c in FORCE_COMPONENTS
+        if isinstance(row.get(f'{c}_Pct'), float)
+    ]
+    if not vals:
+        return 'N/A'
+    worst = max(vals)
+    sign = '+' if worst >= 0 else ''
+    return f'{sign}{worst:.1f}%'
+
+
+def _story_sort_key(name: str) -> tuple:
+    """Sort stories by trailing digits (lowest first), then alphabetical."""
+    m = re.search(r'(\d+)', str(name))
+    return (int(m.group(1)) if m else 0, str(name))
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +149,13 @@ applied based on whether the governing combo is gravity or lateral.
         description='ETABS design output for the modified / repurposed model',
     )
 
-    step2 = vkt.Step('Configure & Compare', views=['results_table', 'summary_table'])
+    step2 = vkt.Step('Configure & Compare', views=[
+        'results_table',
+        'results_detail',
+        'results_chart',
+        'summary_table',
+        'key_metrics',
+    ])
 
     step2.section_options = vkt.Section('Comparison Options')
     step2.section_options.member_type = vkt.OptionField(
@@ -125,13 +196,14 @@ applied based on whether the governing combo is gravity or lateral.
 class Controller(vkt.Controller):
     parametrization = Parametrization
 
-    @vkt.TableView('Comparison Results', duration_guess=30)
+    # -- Overview table (primary view) ---------------------------------------
+
+    @vkt.TableView('Overview', duration_guess=30)
     def results_table(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
 
         results = self._run(params)
-
         if not results:
             raise vkt.UserError(
                 'No results to display. If "Failures Only" is selected, '
@@ -140,13 +212,40 @@ class Controller(vkt.Controller):
 
         data = []
         for r in results:
-            pass_val = r.get('Pass', '')
-            color = _RESULT_COLORS.get(pass_val, vkt.Color(128, 128, 128))
-            pass_cell = vkt.TableCell(
-                pass_val,
-                background_color=color,
-                text_color=vkt.Color(255, 255, 255),
+            data.append([
+                r.get('Story', ''),
+                r.get('Label', ''),
+                r.get('MemberType', ''),
+                r.get('DesignSection_Exist', ''),
+                r.get('DesignSection_New', ''),
+                r.get('LoadType', ''),
+                r.get('PMM_Exist', ''),
+                r.get('PMM_New', ''),
+                _fmt_pct(r.get('PMM_Pct', '')),
+                _fmt_pct(r.get('VMaj_Pct', '')),
+                _worst_force_pct(r),
+                r.get('FailReason', ''),
+                _result_cell(r.get('Pass', '')),
+            ])
+
+        return vkt.TableResult(data, column_headers=OVERVIEW_HEADERS)
+
+    # -- Full detail table ---------------------------------------------------
+
+    @vkt.TableView('Full Detail', duration_guess=30)
+    def results_detail(self, params, **kwargs):
+        if not params.step1.existing_file or not params.step1.modified_file:
+            raise vkt.UserError('Please upload both model files in Step 1.')
+
+        results = self._run(params)
+        if not results:
+            raise vkt.UserError(
+                'No results to display. If "Failures Only" is selected, '
+                'all members may be passing. Try switching to "All Results".'
             )
+
+        data = []
+        for r in results:
             data.append([
                 r.get('Story', ''),
                 r.get('Label', ''),
@@ -156,38 +255,95 @@ class Controller(vkt.Controller):
                 r.get('GovCombo_Exist', ''),
                 r.get('GovCombo_New', ''),
                 r.get('LoadType', ''),
-                r.get('P_Exist', ''), r.get('P_New', ''), r.get('P_Pct', ''),
-                r.get('V2_Exist', ''), r.get('V2_New', ''), r.get('V2_Pct', ''),
-                r.get('V3_Exist', ''), r.get('V3_New', ''), r.get('V3_Pct', ''),
-                r.get('T_Exist', ''), r.get('T_New', ''), r.get('T_Pct', ''),
-                r.get('M2_Exist', ''), r.get('M2_New', ''), r.get('M2_Pct', ''),
-                r.get('M3_Exist', ''), r.get('M3_New', ''), r.get('M3_Pct', ''),
-                r.get('PMM_Exist', ''), r.get('PMM_New', ''), r.get('PMM_Pct', ''),
-                r.get('VMaj_Exist', ''), r.get('VMaj_New', ''), r.get('VMaj_Pct', ''),
+                r.get('P_Exist', ''), r.get('P_New', ''), _fmt_pct(r.get('P_Pct', '')),
+                r.get('V2_Exist', ''), r.get('V2_New', ''), _fmt_pct(r.get('V2_Pct', '')),
+                r.get('V3_Exist', ''), r.get('V3_New', ''), _fmt_pct(r.get('V3_Pct', '')),
+                r.get('T_Exist', ''), r.get('T_New', ''), _fmt_pct(r.get('T_Pct', '')),
+                r.get('M2_Exist', ''), r.get('M2_New', ''), _fmt_pct(r.get('M2_Pct', '')),
+                r.get('M3_Exist', ''), r.get('M3_New', ''), _fmt_pct(r.get('M3_Pct', '')),
+                r.get('PMM_Exist', ''), r.get('PMM_New', ''), _fmt_pct(r.get('PMM_Pct', '')),
+                r.get('VMaj_Exist', ''), r.get('VMaj_New', ''), _fmt_pct(r.get('VMaj_Pct', '')),
                 r.get('SignReversal', ''),
-                pass_cell,
+                r.get('FailReason', ''),
+                _result_cell(r.get('Pass', '')),
             ])
 
-        return vkt.TableResult(data, column_headers=COLUMN_HEADERS)
+        return vkt.TableResult(data, column_headers=DETAIL_HEADERS)
+
+    # -- Plotly chart --------------------------------------------------------
+
+    @vkt.PlotlyView('Results Chart', duration_guess=30)
+    def results_chart(self, params, **kwargs):
+        if not params.step1.existing_file or not params.step1.modified_file:
+            raise vkt.UserError('Please upload both model files in Step 1.')
+
+        all_results = self._run_all(params)
+        if not all_results:
+            raise vkt.UserError('No data to chart.')
+
+        import pandas as pd
+        from plotly.subplots import make_subplots
+        import plotly.graph_objects as go
+
+        df = pd.DataFrame(all_results)[['Story', 'MemberType', 'Pass']]
+
+        member_types = sorted(df['MemberType'].unique())
+        stories = sorted(df['Story'].unique(), key=_story_sort_key, reverse=True)
+        n_types = len(member_types)
+
+        grouped = (
+            df.groupby(['Story', 'MemberType', 'Pass'])
+            .size()
+            .reset_index(name='Count')
+        )
+
+        fig = make_subplots(
+            rows=1, cols=n_types,
+            subplot_titles=member_types,
+            shared_yaxes=True,
+            horizontal_spacing=0.04,
+        )
+
+        status_order = ['FAIL', 'PASS', 'ADDED', 'REMOVED']
+        for col_idx, mtype in enumerate(member_types, start=1):
+            sub = grouped[grouped['MemberType'] == mtype]
+            for status in status_order:
+                s = sub[sub['Pass'] == status]
+                counts_by_story = dict(zip(s['Story'], s['Count']))
+                x_vals = [counts_by_story.get(st, 0) for st in stories]
+                fig.add_trace(
+                    go.Bar(
+                        name=status,
+                        x=x_vals,
+                        y=stories,
+                        orientation='h',
+                        marker_color=_CHART_COLORS[status],
+                        showlegend=(col_idx == 1),
+                        legendgroup=status,
+                        hovertemplate='%{y}: %{x}<extra>' + status + '</extra>',
+                    ),
+                    row=1, col=col_idx,
+                )
+
+        fig.update_layout(
+            barmode='stack',
+            title='Members by Story and Status (highest story at top)',
+            height=max(420, 28 * len(stories) + 120),
+            legend=dict(orientation='h', yanchor='bottom', y=1.05,
+                        xanchor='right', x=1),
+            margin=dict(l=10, r=20, t=80, b=40),
+        )
+
+        return vkt.PlotlyResult(fig)
+
+    # -- Summary table -------------------------------------------------------
 
     @vkt.TableView('Summary by Story', duration_guess=30)
     def summary_table(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
 
-        # Summary always runs over all results (no failures-only filter)
-        p = params.step2.section_options
-        all_results = run_comparison(
-            existing_file=params.step1.existing_file.file,
-            modified_file=params.step1.modified_file.file,
-            member_type_filter=p.member_type or 'All',
-            gravity_threshold=float(p.gravity_threshold or 5),
-            lateral_threshold=float(p.lateral_threshold or 10),
-            show_failures_only=False,
-        )
-
-        summary = build_summary(all_results)
-
+        summary = build_summary(self._run_all(params))
         if not summary:
             raise vkt.UserError('No data to summarise.')
 
@@ -203,38 +359,107 @@ class Controller(vkt.Controller):
                 text_color=vkt.Color(255, 255, 255),
             )
             data.append([
-                s['Story'],
-                s['MemberType'],
-                s['Total'],
-                s['PASS'],
-                fail_cell,
-                s['ADDED'],
-                s['REMOVED'],
+                s['Story'], s['MemberType'], s['Total'],
+                s['PASS'], fail_cell, s['ADDED'], s['REMOVED'],
             ])
 
         return vkt.TableResult(data, column_headers=SUMMARY_HEADERS)
 
-    def download_csv(self, params, **kwargs):
+    # -- Key metrics DataView ------------------------------------------------
+
+    @vkt.DataView('Key Metrics', duration_guess=30)
+    def key_metrics(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
 
-        p = params.step2.section_options
-        results = run_comparison(
-            existing_file=params.step1.existing_file.file,
-            modified_file=params.step1.modified_file.file,
-            member_type_filter=p.member_type or 'All',
-            gravity_threshold=float(p.gravity_threshold or 5),
-            lateral_threshold=float(p.lateral_threshold or 10),
-            show_failures_only=False,  # always export everything
-        )
-        csv_string = results_to_csv(results)
-        return vkt.DownloadResult(csv_string, 'etabs_comparison_results.csv')
+        all_results = self._run_all(params)
+        if not all_results:
+            raise vkt.UserError('No data.')
 
-    # -------------------------------------------------------------------------
-    # Shared helper
-    # -------------------------------------------------------------------------
+        from collections import Counter
+        total    = len(all_results)
+        failures = [r for r in all_results if r.get('Pass') == 'FAIL']
+        added    = [r for r in all_results if r.get('Pass') == 'ADDED']
+        removed  = [r for r in all_results if r.get('Pass') == 'REMOVED']
+        n_fail   = len(failures)
+        fail_rate = round(n_fail / total * 100, 1) if total > 0 else 0.0
+
+        # Worst PMM change among matched members
+        worst_pmm_pct = None
+        worst_pmm_label = ''
+        for r in all_results:
+            pct = r.get('PMM_Pct')
+            if isinstance(pct, float) and (worst_pmm_pct is None or pct > worst_pmm_pct):
+                worst_pmm_pct = pct
+                worst_pmm_label = f"{r.get('Story')} / {r.get('Label')}"
+
+        # Most affected story
+        story_fail_counts = Counter(r.get('Story') for r in failures)
+        if story_fail_counts:
+            top_story, top_count = story_fail_counts.most_common(1)[0]
+        else:
+            top_story, top_count = 'None', 0
+
+        fail_status = vkt.DataStatus.ERROR if n_fail > 0 else vkt.DataStatus.SUCCESS
+        rate_status = (
+            vkt.DataStatus.ERROR   if fail_rate > 10 else
+            vkt.DataStatus.WARNING if fail_rate > 0  else
+            vkt.DataStatus.SUCCESS
+        )
+        pmm_status = (
+            vkt.DataStatus.ERROR if (worst_pmm_pct or 0) > 10 else
+            vkt.DataStatus.WARNING if (worst_pmm_pct or 0) > 0 else
+            vkt.DataStatus.INFO
+        )
+
+        data = vkt.DataGroup(
+            vkt.DataItem('Total Members Compared', total),
+            vkt.DataItem(
+                'Failures',
+                n_fail,
+                status=fail_status,
+                status_message=(
+                    'Members exceeding IBC 3403 thresholds'
+                    if n_fail > 0 else 'All members within threshold'
+                ),
+            ),
+            vkt.DataItem(
+                'Failure Rate',
+                fail_rate,
+                suffix='%',
+                number_of_decimals=1,
+                status=rate_status,
+            ),
+            vkt.DataItem('Added Members', len(added)),
+            vkt.DataItem('Removed Members', len(removed)),
+            vkt.DataItem(
+                'Worst PMM Change',
+                worst_pmm_pct if worst_pmm_pct is not None else 0.0,
+                suffix='%',
+                number_of_decimals=1,
+                status=pmm_status,
+                explanation_label=worst_pmm_label,
+            ),
+            vkt.DataItem(
+                'Most Affected Story',
+                top_story,
+                explanation_label=f'{top_count} failures',
+            ),
+        )
+        return vkt.DataResult(data)
+
+    # -- CSV export ----------------------------------------------------------
+
+    def download_csv(self, params, **kwargs):
+        if not params.step1.existing_file or not params.step1.modified_file:
+            raise vkt.UserError('Please upload both model files in Step 1.')
+        results = self._run_all(params)
+        return vkt.DownloadResult(results_to_csv(results), 'etabs_comparison_results.csv')
+
+    # -- Shared helpers ------------------------------------------------------
 
     def _run(self, params):
+        """Filtered results (respects display_filter param)."""
         p = params.step2.section_options
         return run_comparison(
             existing_file=params.step1.existing_file.file,
@@ -243,4 +468,16 @@ class Controller(vkt.Controller):
             gravity_threshold=float(p.gravity_threshold or 5),
             lateral_threshold=float(p.lateral_threshold or 10),
             show_failures_only=(p.display_filter == 'Failures Only'),
+        )
+
+    def _run_all(self, params):
+        """Unfiltered results — used by chart, summary, key metrics, and CSV."""
+        p = params.step2.section_options
+        return run_comparison(
+            existing_file=params.step1.existing_file.file,
+            modified_file=params.step1.modified_file.file,
+            member_type_filter=p.member_type or 'All',
+            gravity_threshold=float(p.gravity_threshold or 5),
+            lateral_threshold=float(p.lateral_threshold or 10),
+            show_failures_only=False,
         )
