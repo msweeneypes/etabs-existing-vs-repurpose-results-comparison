@@ -160,7 +160,9 @@ changes will be near-instant.
         'key_metrics',
     ])
 
-    step2.intro_method = vkt.Text("""
+    step2.section_about = vkt.Section('How This Works')
+
+    step2.section_about.intro_method = vkt.Text("""
 ## How This Comparison Works
 
 This tool compares structural demand on every steel member between the **existing** and **modified** models to check compliance with **IBC Section 3403**, which governs force increases in members of existing buildings being modified or repurposed.
@@ -168,7 +170,7 @@ This tool compares structural demand on every steel member between the **existin
 For each matched member the tool finds the **worst-case force across all ETABS design load combinations and stations**, then computes the percent change in magnitude as (abs(new) - abs(exist)) / abs(exist) x 100. Using absolute values ensures a sign reversal (tension flipping to compression) does not artificially inflate the percentage. Sign reversals are flagged separately in the Sign Rev. column.
 """)
 
-    step2.intro_columns = vkt.Text("""
+    step2.section_about.intro_columns = vkt.Text("""
 ### What the columns mean
 
 **P** - Axial force (kip). Positive = tension, negative = compression.
@@ -188,7 +190,7 @@ For each matched member the tool finds the **worst-case force across all ETABS d
 **Fail Reason** - Plain-English description of what caused the FAIL flag, e.g. "M3 +23.5% > 5% gravity".
 """)
 
-    step2.intro_thresholds = vkt.Text("""
+    step2.section_about.intro_thresholds = vkt.Text("""
 ### Pass / Fail and Load Classification (IBC 3403)
 
 A member is flagged **FAIL** if any force component or D/C ratio increases by more than the threshold for its governing load type:
