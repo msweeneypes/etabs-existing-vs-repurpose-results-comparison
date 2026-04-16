@@ -14,6 +14,7 @@ import re
 from collections import defaultdict
 
 import pandas as pd
+from openpyxl import load_workbook
 
 FORCE_COMPONENTS = ['P', 'V2', 'V3', 'T', 'M2', 'M3']
 
@@ -67,13 +68,10 @@ def _file_hash(file_obj) -> str:
 
 def _read_etabs_sheet(file_source, sheet_name: str, usecols=None) -> pd.DataFrame:
     """
-    Read one ETABS-exported sheet.
+    Read one ETABS-exported sheet into a DataFrame (used for small sheets only).
 
-    file_source may be a Viktor file object or raw bytes (preferred — avoids
-    a network download per call in the published environment).
-
-    ETABS layout: row 0 = table title, row 1 = column headers,
-    row 2 = units row, row 3+ = data.
+    file_source may be a Viktor file object or raw bytes.
+    ETABS layout: row 0 = table title, row 1 = headers, row 2 = units, row 3+ = data.
     Returns an empty DataFrame on any error.
     """
     try:
@@ -107,44 +105,93 @@ def _max_abs_val(series: pd.Series) -> float:
 # Parsers
 # ---------------------------------------------------------------------------
 
-def parse_design_forces(file_obj, member_type: str) -> pd.DataFrame:
+def parse_design_forces(file_source, member_type: str) -> pd.DataFrame:
     """
-    Parse one Design Forces sheet and aggregate to one row per member.
+    Parse one Design Forces sheet using openpyxl read_only streaming.
 
-    For each member (Story + Label) the force value stored is the one with
-    the largest absolute magnitude across all design combos and stations.
-    Returns empty DataFrame if the sheet is missing.
+    Streams rows one at a time and accumulates the max-abs-value per
+    (Story, Label) pair inline — peak memory is proportional to the number
+    of unique members, not the total row count.  This avoids the OOM kill
+    that occurs in Viktor's published workers (500 MB RAM limit) when the
+    full multi-million-row sheet is loaded as a DataFrame.
+
+    Returns empty DataFrame if the sheet is missing or cannot be read.
     """
-    sheet = DESIGN_FORCES_SHEETS[member_type]
-    label_col = LABEL_COL[member_type]
-
-    # Only read the columns we actually need — skip UniqueName, Combo, Station
-    needed_cols = {'Story', label_col} | set(FORCE_COMPONENTS)
-    df = _read_etabs_sheet(file_obj, sheet, usecols=lambda col: col in needed_cols)
-
+    sheet_name = DESIGN_FORCES_SHEETS[member_type]
+    label_col_name = LABEL_COL[member_type]
     empty = pd.DataFrame(columns=['Story', 'Label'] + FORCE_COMPONENTS)
 
-    if df.empty or label_col not in df.columns:
-        return empty
-
-    df = df.rename(columns={label_col: 'Label'})
-    df = df[df['Label'].notna()].copy()
-
-    if df.empty:
-        return empty
-
-    for col in FORCE_COMPONENTS:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+    try:
+        if isinstance(file_source, (bytes, bytearray)):
+            fh = io.BytesIO(file_source)
         else:
-            df[col] = 0.0
+            with file_source.open_binary() as raw:
+                fh = io.BytesIO(raw.read())
 
-    result = (
-        df.groupby(['Story', 'Label'], sort=False)[FORCE_COMPONENTS]
-        .agg(_max_abs_val)
-        .reset_index()
+        wb = load_workbook(fh, read_only=True, data_only=True)
+        if sheet_name not in wb.sheetnames:
+            wb.close()
+            return empty
+
+        ws = wb[sheet_name]
+        rows_iter = ws.rows
+
+        # ETABS layout: row 0 = title, row 1 = headers, row 2 = units, row 3+ = data
+        try:
+            next(rows_iter)                        # skip title
+            header_cells = next(rows_iter)         # column headers
+            next(rows_iter)                        # skip units row
+        except StopIteration:
+            wb.close()
+            return empty
+
+        headers = [cell.value for cell in header_cells]
+        col_map = {v: i for i, v in enumerate(headers) if v is not None}
+
+        story_i = col_map.get('Story')
+        label_i = col_map.get(label_col_name)
+        if story_i is None or label_i is None:
+            wb.close()
+            return empty
+
+        force_col_indices = {c: col_map.get(c) for c in FORCE_COMPONENTS}
+
+        # Online max-abs aggregation — stores one float per (member, component).
+        # Memory is O(unique members), not O(rows), regardless of file size.
+        accum: dict = {}
+
+        for row in rows_iter:
+            vals = [cell.value for cell in row]
+            n = len(vals)
+            story = vals[story_i] if story_i < n else None
+            label = vals[label_i] if label_i < n else None
+            if story is None or label is None:
+                continue
+
+            key = (story, label)
+            if key not in accum:
+                accum[key] = dict.fromkeys(FORCE_COMPONENTS, 0.0)
+
+            for c, ci in force_col_indices.items():
+                if ci is not None and ci < n and vals[ci] is not None:
+                    try:
+                        v = float(vals[ci])
+                        if abs(v) > abs(accum[key][c]):
+                            accum[key][c] = v
+                    except (TypeError, ValueError):
+                        pass
+
+        wb.close()
+
+    except Exception:
+        return empty
+
+    if not accum:
+        return empty
+
+    return pd.DataFrame(
+        [{'Story': s, 'Label': l, **forces} for (s, l), forces in accum.items()]
     )
-    return result
 
 
 def parse_design_summary(file_obj) -> pd.DataFrame:
