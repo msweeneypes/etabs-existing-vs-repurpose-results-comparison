@@ -5,7 +5,8 @@
       "Bash(/c/Users/msweeney/viktor-apps/etabs-existing-vs-repurpose-results-comparison/venv/Scripts/python.exe -c \"import openpyxl; wb = openpyxl.load_workbook\\('Union Church existing design loads.xlsx', data_only=True\\); sheets = wb.sheetnames; design_sheets = [s for s in sheets if 'Design Forces' in s]; summary_sheet = 'Stl Frm Sum - AISC 360-16' if 'Stl Frm Sum - AISC 360-16' in sheets else None; print\\('Design Forces sheets:', design_sheets\\); print\\('Summary sheet:', summary_sheet\\); print\\(\\); [print\\(f'{s}: {wb[s].max_row} rows, {wb[s].max_column} cols'\\) for s in [design_sheets[0], summary_sheet] if s in sheets]\")",
       "Bash(git -C /c/Users/msweeney/viktor-apps/etabs-existing-vs-repurpose-results-comparison log --oneline -10)",
       "Bash(venv/Scripts/pip.exe install *)",
-      "Bash(venv/Scripts/python.exe -c \"import app; print\\('OK'\\)\")"
+      "Bash(venv/Scripts/python.exe -c \"import app; print\\('OK'\\)\")",
+      "Read(//c/Users/msweeney/.claude/plans/**)"
     ]
   }
 }

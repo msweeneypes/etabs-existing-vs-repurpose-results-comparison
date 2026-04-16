@@ -9,6 +9,7 @@ module-level dicts keyed on MD5 hash of file content, so re-running with
 different thresholds or display filters is near-instant after the first parse.
 """
 import hashlib
+import io
 import re
 from collections import defaultdict
 
@@ -64,24 +65,31 @@ def _file_hash(file_obj) -> str:
     return hashlib.md5(file_obj.getvalue_binary()).hexdigest()
 
 
-def _read_etabs_sheet(file_obj, sheet_name: str, usecols=None) -> pd.DataFrame:
+def _read_etabs_sheet(file_source, sheet_name: str, usecols=None) -> pd.DataFrame:
     """
     Read one ETABS-exported sheet.
+
+    file_source may be a Viktor file object or raw bytes (preferred — avoids
+    a network download per call in the published environment).
 
     ETABS layout: row 0 = table title, row 1 = column headers,
     row 2 = units row, row 3+ = data.
     Returns an empty DataFrame on any error.
     """
     try:
-        with file_obj.open_binary() as f:
-            df = pd.read_excel(
-                f,
-                sheet_name=sheet_name,
-                header=1,       # row 1 = headers
-                skiprows=[2],   # row 2 = units — drop
-                engine='openpyxl',
-                usecols=usecols,
-            )
+        if isinstance(file_source, (bytes, bytearray)):
+            f = io.BytesIO(file_source)
+        else:
+            with file_source.open_binary() as raw:
+                f = io.BytesIO(raw.read())
+        df = pd.read_excel(
+            f,
+            sheet_name=sheet_name,
+            header=1,       # row 1 = headers
+            skiprows=[2],   # row 2 = units — drop
+            engine='openpyxl',
+            usecols=usecols,
+        )
         return df
     except Exception:
         return pd.DataFrame()
@@ -189,22 +197,26 @@ def parse_design_summary(file_obj) -> pd.DataFrame:
 # Cache helpers
 # ---------------------------------------------------------------------------
 
-def _get_parsed_file(file_obj) -> dict:
+def _get_parsed_file(file_obj) -> tuple:
     """
-    Return pre-parsed DataFrames for a file, computing and caching if absent.
+    Return (file_hash, parsed_dict) for a file, computing and caching if absent.
 
-    Returns {'summary': df, 'forces': {'Columns': df, 'Beams': df, 'Braces': df}}
+    Downloads the file bytes exactly once per call, then passes those bytes to
+    all four sheet reads — avoiding repeated network fetches in the published env.
+
+    parsed_dict = {'summary': df, 'forces': {'Columns': df, 'Beams': df, 'Braces': df}}
     """
-    h = _file_hash(file_obj)
+    file_bytes = file_obj.getvalue_binary()
+    h = hashlib.md5(file_bytes).hexdigest()
     if h not in _PARSE_CACHE:
         _PARSE_CACHE[h] = {
-            'summary': parse_design_summary(file_obj),
+            'summary': parse_design_summary(file_bytes),
             'forces': {
-                mt: parse_design_forces(file_obj, mt)
+                mt: parse_design_forces(file_bytes, mt)
                 for mt in ('Columns', 'Beams', 'Braces')
             },
         }
-    return _PARSE_CACHE[h]
+    return h, _PARSE_CACHE[h]
 
 
 # ---------------------------------------------------------------------------
@@ -527,14 +539,12 @@ def run_comparison(
     GovCombo_Exist/New, LoadType, P/V2/V3/T/M2/M3_Exist/New/Pct,
     PMM_Exist/New/Pct, VMaj_Exist/New/Pct, SignReversal, FailReason, Pass
     """
-    exist_hash = _file_hash(existing_file)
-    new_hash   = _file_hash(modified_file)
+    exist_hash, parsed_exist = _get_parsed_file(existing_file)
+    new_hash,   parsed_new   = _get_parsed_file(modified_file)
     cache_key  = (exist_hash, new_hash, member_type_filter,
                   gravity_threshold, lateral_threshold)
 
     if cache_key not in _RESULTS_CACHE:
-        parsed_exist = _get_parsed_file(existing_file)
-        parsed_new   = _get_parsed_file(modified_file)
         _RESULTS_CACHE[cache_key] = _run_comparison_internal(
             parsed_exist, parsed_new,
             member_type_filter, gravity_threshold, lateral_threshold,
