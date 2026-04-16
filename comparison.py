@@ -66,150 +66,103 @@ def _file_hash(file_obj) -> str:
     return hashlib.md5(file_obj.getvalue_binary()).hexdigest()
 
 
-def _read_etabs_sheet(file_source, sheet_name: str, usecols=None) -> pd.DataFrame:
+def _stream_etabs_rows(ws):
     """
-    Read one ETABS-exported sheet into a DataFrame (used for small sheets only).
+    Return (col_map, rows_iter) for an ETABS-formatted worksheet.
 
-    file_source may be a Viktor file object or raw bytes.
-    ETABS layout: row 0 = table title, row 1 = headers, row 2 = units, row 3+ = data.
-    Returns an empty DataFrame on any error.
+    ETABS layout: row 0 = title, row 1 = headers, row 2 = units, row 3+ = data.
+    col_map maps column header name → 0-based column index.
+    Raises StopIteration if the sheet has fewer than 3 rows.
     """
-    try:
-        if isinstance(file_source, (bytes, bytearray)):
-            f = io.BytesIO(file_source)
-        else:
-            with file_source.open_binary() as raw:
-                f = io.BytesIO(raw.read())
-        df = pd.read_excel(
-            f,
-            sheet_name=sheet_name,
-            header=1,       # row 1 = headers
-            skiprows=[2],   # row 2 = units — drop
-            engine='openpyxl',
-            usecols=usecols,
-        )
-        return df
-    except Exception:
-        return pd.DataFrame()
-
-
-def _max_abs_val(series: pd.Series) -> float:
-    """Return the value with the largest absolute magnitude, preserving sign."""
-    s = series.dropna()
-    if s.empty:
-        return 0.0
-    return float(s.iloc[s.abs().argmax()])
+    rows_iter = ws.rows
+    next(rows_iter)                      # row 0: table title
+    header_cells = next(rows_iter)       # row 1: column headers
+    next(rows_iter)                      # row 2: units — skip
+    col_map = {
+        cell.value: i
+        for i, cell in enumerate(header_cells)
+        if cell.value is not None
+    }
+    return col_map, rows_iter
 
 
 # ---------------------------------------------------------------------------
-# Parsers
+# Workbook-level parsers (take an already-open read_only workbook)
 # ---------------------------------------------------------------------------
 
-def parse_design_forces(file_source, member_type: str) -> pd.DataFrame:
+def _parse_forces_from_wb(wb, member_type: str) -> pd.DataFrame:
     """
-    Parse one Design Forces sheet using openpyxl read_only streaming.
+    Stream one Design Forces worksheet from an open workbook.
 
-    Streams rows one at a time and accumulates the max-abs-value per
-    (Story, Label) pair inline — peak memory is proportional to the number
-    of unique members, not the total row count.  This avoids the OOM kill
-    that occurs in Viktor's published workers (500 MB RAM limit) when the
-    full multi-million-row sheet is loaded as a DataFrame.
-
-    Returns empty DataFrame if the sheet is missing or cannot be read.
+    Online max-abs aggregation: stores one float per (Story, Label, component).
+    Peak memory is O(unique members), not O(rows), regardless of file size.
     """
-    sheet_name = DESIGN_FORCES_SHEETS[member_type]
+    sheet_name    = DESIGN_FORCES_SHEETS[member_type]
     label_col_name = LABEL_COL[member_type]
     empty = pd.DataFrame(columns=['Story', 'Label'] + FORCE_COMPONENTS)
 
-    try:
-        if isinstance(file_source, (bytes, bytearray)):
-            fh = io.BytesIO(file_source)
-        else:
-            with file_source.open_binary() as raw:
-                fh = io.BytesIO(raw.read())
-
-        wb = load_workbook(fh, read_only=True, data_only=True)
-        if sheet_name not in wb.sheetnames:
-            wb.close()
-            return empty
-
-        ws = wb[sheet_name]
-        rows_iter = ws.rows
-
-        # ETABS layout: row 0 = title, row 1 = headers, row 2 = units, row 3+ = data
-        try:
-            next(rows_iter)                        # skip title
-            header_cells = next(rows_iter)         # column headers
-            next(rows_iter)                        # skip units row
-        except StopIteration:
-            wb.close()
-            return empty
-
-        headers = [cell.value for cell in header_cells]
-        col_map = {v: i for i, v in enumerate(headers) if v is not None}
-
-        story_i = col_map.get('Story')
-        label_i = col_map.get(label_col_name)
-        if story_i is None or label_i is None:
-            wb.close()
-            return empty
-
-        force_col_indices = {c: col_map.get(c) for c in FORCE_COMPONENTS}
-
-        # Online max-abs aggregation — stores one float per (member, component).
-        # Memory is O(unique members), not O(rows), regardless of file size.
-        accum: dict = {}
-
-        for row in rows_iter:
-            vals = [cell.value for cell in row]
-            n = len(vals)
-            story = vals[story_i] if story_i < n else None
-            label = vals[label_i] if label_i < n else None
-            if story is None or label is None:
-                continue
-
-            key = (story, label)
-            if key not in accum:
-                accum[key] = dict.fromkeys(FORCE_COMPONENTS, 0.0)
-
-            for c, ci in force_col_indices.items():
-                if ci is not None and ci < n and vals[ci] is not None:
-                    try:
-                        v = float(vals[ci])
-                        if abs(v) > abs(accum[key][c]):
-                            accum[key][c] = v
-                    except (TypeError, ValueError):
-                        pass
-
-        wb.close()
-
-    except Exception:
+    if sheet_name not in wb.sheetnames:
         return empty
+
+    try:
+        col_map, rows_iter = _stream_etabs_rows(wb[sheet_name])
+    except StopIteration:
+        return empty
+
+    story_i = col_map.get('Story')
+    label_i = col_map.get(label_col_name)
+    if story_i is None or label_i is None:
+        return empty
+
+    force_col_indices = {c: col_map.get(c) for c in FORCE_COMPONENTS}
+    accum: dict = {}
+
+    for row in rows_iter:
+        vals = [cell.value for cell in row]
+        n    = len(vals)
+        story = vals[story_i] if story_i < n else None
+        label = vals[label_i] if label_i < n else None
+        if story is None or label is None:
+            continue
+        key = (story, label)
+        if key not in accum:
+            accum[key] = dict.fromkeys(FORCE_COMPONENTS, 0.0)
+        for c, ci in force_col_indices.items():
+            if ci is not None and ci < n and vals[ci] is not None:
+                try:
+                    v = float(vals[ci])
+                    if abs(v) > abs(accum[key][c]):
+                        accum[key][c] = v
+                except (TypeError, ValueError):
+                    pass
 
     if not accum:
         return empty
-
     return pd.DataFrame(
         [{'Story': s, 'Label': l, **forces} for (s, l), forces in accum.items()]
     )
 
 
-def parse_design_summary(file_obj) -> pd.DataFrame:
+def _parse_summary_from_wb(wb) -> pd.DataFrame:
     """
-    Parse the Steel Frame Design Summary sheet.
+    Stream the Steel Frame Design Summary worksheet from an open workbook.
 
     Returns one row per member with design section and D/C ratio data.
     """
-    df = _read_etabs_sheet(file_obj, SUMMARY_SHEET)
     empty = pd.DataFrame(columns=[
         'Story', 'Label', 'MemberType', 'DesignSection',
         'PMMCombo', 'PMMRatio', 'VMajCombo', 'VMajRatio',
     ])
 
-    if df.empty:
+    if SUMMARY_SHEET not in wb.sheetnames:
         return empty
 
-    rename = {
+    try:
+        col_map, rows_iter = _stream_etabs_rows(wb[SUMMARY_SHEET])
+    except StopIteration:
+        return empty
+
+    name_remap = {
         'Design Type':    'MemberType',
         'Design Section': 'DesignSection',
         'PMM Combo':      'PMMCombo',
@@ -217,14 +170,35 @@ def parse_design_summary(file_obj) -> pd.DataFrame:
         'V Major Combo':  'VMajCombo',
         'V Major Ratio':  'VMajRatio',
     }
-    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+    idx = {name_remap.get(k, k): i for k, i in col_map.items()}
 
-    needed = ['Story', 'Label', 'MemberType', 'DesignSection',
-              'PMMCombo', 'PMMRatio', 'VMajCombo', 'VMajRatio']
-    df = df[[c for c in needed if c in df.columns]].copy()
+    story_i = idx.get('Story')
+    label_i = idx.get('Label')
+    if story_i is None or label_i is None:
+        return empty
+
+    extra_fields = ('MemberType', 'DesignSection', 'PMMCombo', 'PMMRatio', 'VMajCombo', 'VMajRatio')
+    rows_out = []
+
+    for row in rows_iter:
+        vals = [cell.value for cell in row]
+        n    = len(vals)
+        story = vals[story_i] if story_i < n else None
+        label = vals[label_i] if label_i < n else None
+        if story is None or label is None:
+            continue
+        row_dict = {'Story': story, 'Label': label}
+        for field in extra_fields:
+            fi = idx.get(field)
+            row_dict[field] = vals[fi] if fi is not None and fi < n else None
+        rows_out.append(row_dict)
+
+    if not rows_out:
+        return empty
+
+    df = pd.DataFrame(rows_out)
     df = df[df['Label'].notna()].copy()
 
-    # Strip the "(C)" / "(T)" compression/tension suffix from combo names
     for col in ('PMMCombo', 'VMajCombo'):
         if col in df.columns:
             df[col] = (
@@ -232,12 +206,49 @@ def parse_design_summary(file_obj) -> pd.DataFrame:
                 .str.replace(r'\s*\([CT]\)\s*$', '', regex=True)
                 .str.strip()
             )
-
     for col in ('PMMRatio', 'VMajRatio'):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
     return df
+
+
+# ---------------------------------------------------------------------------
+# Public parser wrappers (open their own workbook — used for standalone testing)
+# ---------------------------------------------------------------------------
+
+def parse_design_forces(file_source, member_type: str) -> pd.DataFrame:
+    """Parse one Design Forces sheet. _get_parsed_file uses _parse_forces_from_wb instead."""
+    try:
+        if isinstance(file_source, (bytes, bytearray)):
+            fh = io.BytesIO(file_source)
+        else:
+            with file_source.open_binary() as raw:
+                fh = io.BytesIO(raw.read())
+        wb = load_workbook(fh, read_only=True, data_only=True)
+        try:
+            return _parse_forces_from_wb(wb, member_type)
+        finally:
+            wb.close()
+    except Exception:
+        return pd.DataFrame(columns=['Story', 'Label'] + FORCE_COMPONENTS)
+
+
+def parse_design_summary(file_source) -> pd.DataFrame:
+    """Parse the Design Summary sheet. _get_parsed_file uses _parse_summary_from_wb instead."""
+    try:
+        if isinstance(file_source, (bytes, bytearray)):
+            fh = io.BytesIO(file_source)
+        else:
+            with file_source.open_binary() as raw:
+                fh = io.BytesIO(raw.read())
+        wb = load_workbook(fh, read_only=True, data_only=True)
+        try:
+            return _parse_summary_from_wb(wb)
+        finally:
+            wb.close()
+    except Exception:
+        return pd.DataFrame()
 
 
 # ---------------------------------------------------------------------------
@@ -248,21 +259,36 @@ def _get_parsed_file(file_obj) -> tuple:
     """
     Return (file_hash, parsed_dict) for a file, computing and caching if absent.
 
-    Downloads the file bytes exactly once per call, then passes those bytes to
-    all four sheet reads — avoiding repeated network fetches in the published env.
+    Opens the workbook exactly once and reads all four sheets in a single pass.
+    File bytes are released before parsing begins to minimise peak memory usage.
 
     parsed_dict = {'summary': df, 'forces': {'Columns': df, 'Beams': df, 'Braces': df}}
     """
     file_bytes = file_obj.getvalue_binary()
     h = hashlib.md5(file_bytes).hexdigest()
     if h not in _PARSE_CACHE:
-        _PARSE_CACHE[h] = {
-            'summary': parse_design_summary(file_bytes),
-            'forces': {
-                mt: parse_design_forces(file_bytes, mt)
-                for mt in ('Columns', 'Beams', 'Braces')
-            },
-        }
+        fh = io.BytesIO(file_bytes)
+        del file_bytes          # release raw bytes — BytesIO holds its own copy
+        try:
+            wb = load_workbook(fh, read_only=True, data_only=True)
+            try:
+                _PARSE_CACHE[h] = {
+                    'summary': _parse_summary_from_wb(wb),
+                    'forces': {
+                        mt: _parse_forces_from_wb(wb, mt)
+                        for mt in ('Columns', 'Beams', 'Braces')
+                    },
+                }
+            finally:
+                wb.close()
+        except Exception:
+            _PARSE_CACHE[h] = {
+                'summary': pd.DataFrame(),
+                'forces': {
+                    mt: pd.DataFrame(columns=['Story', 'Label'] + FORCE_COMPONENTS)
+                    for mt in ('Columns', 'Beams', 'Braces')
+                },
+            }
     return h, _PARSE_CACHE[h]
 
 
