@@ -31,7 +31,7 @@ LABEL_COL = {
     'Braces':  'Brace',
 }
 
-SUMMARY_SHEET = 'Stl Frm Sum - AISC 360-16'
+SUMMARY_SHEET_PREFIX = 'Stl Frm Sum'
 
 # Design type string as it appears in the Design Summary sheet
 DESIGN_TYPE = {
@@ -154,11 +154,14 @@ def _parse_summary_from_wb(wb) -> pd.DataFrame:
         'PMMCombo', 'PMMRatio', 'VMajCombo', 'VMajRatio',
     ])
 
-    if SUMMARY_SHEET not in wb.sheetnames:
+    summary_sheet = next(
+        (s for s in wb.sheetnames if s.startswith(SUMMARY_SHEET_PREFIX)), None
+    )
+    if summary_sheet is None:
         return empty
 
     try:
-        col_map, rows_iter = _stream_etabs_rows(wb[SUMMARY_SHEET])
+        col_map, rows_iter = _stream_etabs_rows(wb[summary_sheet])
     except StopIteration:
         return empty
 
@@ -278,6 +281,7 @@ def _get_parsed_file(file_obj) -> tuple:
                         mt: _parse_forces_from_wb(wb, mt)
                         for mt in ('Columns', 'Beams', 'Braces')
                     },
+                    'sheet_names': list(wb.sheetnames),
                 }
             finally:
                 wb.close()
@@ -288,6 +292,7 @@ def _get_parsed_file(file_obj) -> tuple:
                     mt: pd.DataFrame(columns=['Story', 'Label'] + FORCE_COMPONENTS)
                     for mt in ('Columns', 'Beams', 'Braces')
                 },
+                'sheet_names': [],
             }
     return h, _PARSE_CACHE[h]
 
@@ -426,13 +431,13 @@ def _run_comparison_internal(
         forces_exist = parsed_exist['forces'][mtype]
         forces_new   = parsed_new['forces'][mtype]
 
-        def _member_set(ds):
-            if ds.empty or 'Story' not in ds.columns:
+        def _force_member_set(df):
+            if df.empty or 'Story' not in df.columns:
                 return set()
-            return set(zip(ds['Story'], ds['Label']))
+            return set(zip(df['Story'], df['Label']))
 
-        exist_members = _member_set(ds_exist)
-        new_members   = _member_set(ds_new)
+        exist_members = _force_member_set(forces_exist)
+        new_members   = _force_member_set(forces_new)
         all_members   = exist_members | new_members
 
         def _build_lookup(ds):
@@ -461,8 +466,8 @@ def _run_comparison_internal(
             in_exist = (story, label) in exist_members
             in_new   = (story, label) in new_members
 
-            es = exist_lookup.get((story, label))
-            ns = new_lookup.get((story, label))
+            es = exist_lookup.get((story, label))   # summary row — may be None
+            ns = new_lookup.get((story, label))     # summary row — may be None
             ef = fe_lookup.get((story, label))
             nf = fn_lookup.get((story, label))
 

@@ -2,7 +2,10 @@ import re
 
 import viktor as vkt
 
-from comparison import build_summary, results_to_csv, run_comparison, FORCE_COMPONENTS
+from comparison import (
+    build_summary, results_to_csv, run_comparison, FORCE_COMPONENTS,
+    DESIGN_FORCES_SHEETS, _get_parsed_file,
+)
 
 # ---------------------------------------------------------------------------
 # Column headers
@@ -240,6 +243,44 @@ Start with the **Overview** tab to spot failures quickly. Use **Full Detail** to
 
 
 # ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+def _no_results_message(params) -> str:
+    """Return a descriptive error message explaining why no results were produced."""
+    _, pe = _get_parsed_file(params.step1.existing_file.file)
+    _, pn = _get_parsed_file(params.step1.modified_file.file)
+
+    e_sheets = pe.get('sheet_names', [])
+    n_sheets = pn.get('sheet_names', [])
+
+    expected = list(DESIGN_FORCES_SHEETS.values())
+    e_missing = [s for s in expected if s not in e_sheets]
+    n_missing = [s for s in expected if s not in n_sheets]
+
+    if e_missing or n_missing:
+        lines = [f'No members found. Expected sheets: {expected}']
+        if e_missing:
+            lines.append(f'Existing file missing: {e_missing}  (found: {e_sheets})')
+        if n_missing:
+            lines.append(f'Modified file missing: {n_missing}  (found: {n_sheets})')
+        return '\n'.join(lines)
+
+    e_counts = {mt: len(pe['forces'][mt]) for mt in DESIGN_FORCES_SHEETS}
+    n_counts = {mt: len(pn['forces'][mt]) for mt in DESIGN_FORCES_SHEETS}
+    if all(v == 0 for v in e_counts.values()) or all(v == 0 for v in n_counts.values()):
+        return (
+            f'Forces sheets parsed but returned 0 rows.\n'
+            f'Existing: {e_counts}\nModified: {n_counts}'
+        )
+
+    return (
+        'No results to display. If "Failures Only" is selected, '
+        'all members may be passing. Try switching to "All Results".'
+    )
+
+
+# ---------------------------------------------------------------------------
 # Controller
 # ---------------------------------------------------------------------------
 
@@ -255,10 +296,7 @@ class Controller(vkt.Controller):
 
         results = self._run(params)
         if not results:
-            raise vkt.UserError(
-                'No results to display. If "Failures Only" is selected, '
-                'all members may be passing. Try switching to "All Results".'
-            )
+            raise vkt.UserError(_no_results_message(params))
 
         data = []
         for r in results:
@@ -289,10 +327,7 @@ class Controller(vkt.Controller):
 
         results = self._run(params)
         if not results:
-            raise vkt.UserError(
-                'No results to display. If "Failures Only" is selected, '
-                'all members may be passing. Try switching to "All Results".'
-            )
+            raise vkt.UserError(_no_results_message(params))
 
         data = []
         for r in results:
