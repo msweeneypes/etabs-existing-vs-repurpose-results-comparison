@@ -1,4 +1,5 @@
 import re
+from typing import Optional
 
 import viktor as vkt
 
@@ -161,6 +162,7 @@ changes will be near-instant.
         'results_chart',
         'summary_table',
         'key_metrics',
+        'beam_detail_view',
     ])
 
     step2.section_about = vkt.Section('How This Works')
@@ -278,6 +280,203 @@ def _no_results_message(params) -> str:
         'No results to display. If "Failures Only" is selected, '
         'all members may be passing. Try switching to "All Results".'
     )
+
+
+# ---------------------------------------------------------------------------
+# Beam detail HTML renderer
+# ---------------------------------------------------------------------------
+
+def _numeric_pct(val) -> float:
+    """Convert a pct value (float, 'INF', or other) to a float for comparison."""
+    if val == 'INF':
+        return 999.0
+    if isinstance(val, float):
+        return val
+    return 0.0
+
+
+def _render_beam_detail_html(beam: Optional[dict], gravity_thresh: float, lateral_thresh: float) -> str:
+    if beam is None:
+        return (
+            '<p style="font-family:sans-serif;padding:24px;color:#555;font-size:15px;">'
+            'No beam results to display. Ensure beams are included in the member type filter '
+            'and both files are uploaded.</p>'
+        )
+
+    load_type = beam.get('LoadType', 'gravity')
+    threshold = lateral_thresh if load_type == 'lateral' else gravity_thresh
+    pass_val  = beam.get('Pass', '')
+    label     = beam.get('Label', '')
+    story     = beam.get('Story', '')
+    sect_e    = beam.get('DesignSection_Exist', 'N/A')
+    sect_n    = beam.get('DesignSection_New', 'N/A')
+    combo_e   = beam.get('GovCombo_Exist', 'N/A')
+    combo_n   = beam.get('GovCombo_New', 'N/A')
+    fail_rsn  = beam.get('FailReason', '')
+    sign_rev  = beam.get('SignReversal', '')
+
+    banner_bg = '#B22222' if pass_val == 'FAIL' else '#228B22'
+
+    # Narrative sentence
+    if pass_val == 'FAIL':
+        result_phrase = '<span style="font-weight:bold">FAILED</span>'
+        narrative = (
+            f'Beam <strong>{label}</strong> on Story <strong>{story}</strong> {result_phrase} — '
+            f'{fail_rsn}.'
+        )
+    else:
+        result_phrase = '<span style="font-weight:bold">PASSED</span>'
+        narrative = (
+            f'Beam <strong>{label}</strong> on Story <strong>{story}</strong> {result_phrase} '
+            f'all threshold checks ({load_type} threshold: {threshold:.1f}%).'
+        )
+    if sect_e != sect_n:
+        narrative += f' Section changed from <strong>{sect_e}</strong> to <strong>{sect_n}</strong>.'
+    else:
+        narrative += f' Section unchanged: <strong>{sect_e}</strong>.'
+    if sign_rev == 'YES':
+        narrative += ' <span style="color:#B46400;font-weight:bold">&#9888; Sign reversal detected on at least one force component.</span>'
+
+    # Shared cell/row styles
+    TH = 'padding:8px 12px;text-align:left;font-size:13px;border-bottom:2px solid #ccc;white-space:nowrap'
+    TD = 'padding:7px 12px;font-size:13px;border-bottom:1px solid #e5e5e5'
+
+    def _fmt(val) -> str:
+        if isinstance(val, float):
+            return f'{val:.3f}'
+        return str(val) if val not in (None, '') else 'N/A'
+
+    def _fmt_change(pct_val) -> str:
+        if pct_val == 'INF':
+            return 'INF'
+        if isinstance(pct_val, float):
+            sign = '+' if pct_val >= 0 else ''
+            return f'{sign}{pct_val:.1f}%'
+        return 'N/A'
+
+    def _force_row(name: str, exist_val, new_val, pct_val, thresh: float) -> str:
+        is_fail = (pct_val == 'INF') or (isinstance(pct_val, float) and pct_val > thresh)
+        row_bg  = '#fff0f0' if is_fail else 'transparent'
+        status  = 'FAIL' if is_fail else 'PASS'
+        sc      = '#B22222' if is_fail else '#228B22'
+        return (
+            f'<tr style="background:{row_bg}">'
+            f'<td style="{TD};font-weight:bold">{name}</td>'
+            f'<td style="{TD}">{_fmt(exist_val)}</td>'
+            f'<td style="{TD}">{_fmt(new_val)}</td>'
+            f'<td style="{TD}">{_fmt_change(pct_val)}</td>'
+            f'<td style="{TD}">{thresh:.1f}%</td>'
+            f'<td style="{TD};color:{sc};font-weight:bold">{status}</td>'
+            f'</tr>'
+        )
+
+    force_rows = ''.join(
+        _force_row(
+            c,
+            beam.get(f'{c}_Exist'), beam.get(f'{c}_New'), beam.get(f'{c}_Pct'), threshold
+        )
+        for c in FORCE_COMPONENTS
+    )
+
+    def _dc_row(name: str, combo_exist: str, combo_new: str, exist_val, new_val, pct_val, thresh: float) -> str:
+        is_fail = (pct_val == 'INF') or (isinstance(pct_val, float) and pct_val > thresh)
+        row_bg  = '#fff0f0' if is_fail else 'transparent'
+        status  = 'FAIL' if is_fail else 'PASS'
+        sc      = '#B22222' if is_fail else '#228B22'
+        ce = combo_exist if combo_exist and combo_exist != 'N/A' else '—'
+        cn = combo_new   if combo_new   and combo_new   != 'N/A' else '—'
+        return (
+            f'<tr style="background:{row_bg}">'
+            f'<td style="{TD};font-weight:bold">{name}</td>'
+            f'<td style="{TD};font-family:monospace;font-size:12px">{ce}</td>'
+            f'<td style="{TD};font-family:monospace;font-size:12px">{cn}</td>'
+            f'<td style="{TD}">{_fmt(exist_val)}</td>'
+            f'<td style="{TD}">{_fmt(new_val)}</td>'
+            f'<td style="{TD}">{_fmt_change(pct_val)}</td>'
+            f'<td style="{TD}">{thresh:.1f}%</td>'
+            f'<td style="{TD};color:{sc};font-weight:bold">{status}</td>'
+            f'</tr>'
+        )
+
+    dc_rows = (
+        _dc_row('PMM', combo_e, combo_n,
+                beam.get('PMM_Exist'), beam.get('PMM_New'), beam.get('PMM_Pct'), threshold) +
+        _dc_row('V Major', combo_e, combo_n,
+                beam.get('VMaj_Exist'), beam.get('VMaj_New'), beam.get('VMaj_Pct'), threshold)
+    )
+
+    card_style = 'background:#f7f7f7;padding:12px 16px;border-radius:5px;border:1px solid #e0e0e0'
+    label_style = 'color:#777;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px'
+    value_style = 'font-size:15px;font-weight:500'
+
+    sect_arrow = f'{sect_e} &rarr; {sect_n}' if sect_e != sect_n else sect_e
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:24px;max-width:960px;color:#222;margin:0 auto">
+
+<div style="background:{banner_bg};color:#fff;padding:12px 20px;border-radius:6px;margin-bottom:18px;font-size:17px;font-weight:bold">
+  {pass_val} &mdash; Beam {label}, Story {story}
+  <span style="font-weight:normal;font-size:13px;margin-left:16px;opacity:0.9">Worst beam auto-selected</span>
+</div>
+
+<p style="font-size:14px;line-height:1.65;margin-bottom:20px;padding:12px 16px;background:#fafafa;border-left:4px solid {banner_bg};border-radius:0 4px 4px 0">
+  {narrative}
+</p>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:24px">
+  <div style="{card_style}">
+    <div style="{label_style}">Design Section</div>
+    <div style="{value_style}">{sect_arrow}</div>
+  </div>
+  <div style="{card_style}">
+    <div style="{label_style}">Load Type / Threshold</div>
+    <div style="{value_style}">{load_type.capitalize()} &mdash; {threshold:.1f}%</div>
+  </div>
+  <div style="{card_style}">
+    <div style="{label_style}">Governing Combo (Existing)</div>
+    <div style="font-size:13px;font-family:monospace">{combo_e}</div>
+  </div>
+  <div style="{card_style}">
+    <div style="{label_style}">Governing Combo (Modified)</div>
+    <div style="font-size:13px;font-family:monospace">{combo_n}</div>
+  </div>
+</div>
+
+<h3 style="font-size:14px;text-transform:uppercase;letter-spacing:0.05em;color:#555;margin-bottom:8px">Force Components</h3>
+<table style="width:100%;border-collapse:collapse;margin-bottom:28px">
+  <thead>
+    <tr style="background:#f0f0f0">
+      <th style="{TH}">Force</th>
+      <th style="{TH}">Existing</th>
+      <th style="{TH}">Modified</th>
+      <th style="{TH}">Change</th>
+      <th style="{TH}">Threshold</th>
+      <th style="{TH}">Status</th>
+    </tr>
+  </thead>
+  <tbody>{force_rows}</tbody>
+</table>
+
+<h3 style="font-size:14px;text-transform:uppercase;letter-spacing:0.05em;color:#555;margin-bottom:8px">Demand / Capacity Ratios</h3>
+<table style="width:100%;border-collapse:collapse">
+  <thead>
+    <tr style="background:#f0f0f0">
+      <th style="{TH}">Check</th>
+      <th style="{TH}">Combo (Existing)</th>
+      <th style="{TH}">Combo (Modified)</th>
+      <th style="{TH}">Existing</th>
+      <th style="{TH}">Modified</th>
+      <th style="{TH}">Change</th>
+      <th style="{TH}">Threshold</th>
+      <th style="{TH}">Status</th>
+    </tr>
+  </thead>
+  <tbody>{dc_rows}</tbody>
+</table>
+
+</body></html>"""
+    return html
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +731,39 @@ class Controller(vkt.Controller):
             ),
         )
         return vkt.DataResult(data)
+
+    # -- Beam detail HTML view -----------------------------------------------
+
+    @vkt.WebView('Beam Detail', duration_guess=30)
+    def beam_detail_view(self, params, **kwargs):
+        if not params.step1.existing_file or not params.step1.modified_file:
+            raise vkt.UserError('Please upload both model files in Step 1.')
+
+        p = params.step2.section_options
+        gravity_thresh  = float(p.gravity_threshold or 5)
+        lateral_thresh  = float(p.lateral_threshold or 10)
+
+        results = self._run_all(params)
+        beam    = self._find_worst_beam(results)
+        html    = _render_beam_detail_html(beam, gravity_thresh, lateral_thresh)
+        return vkt.WebResult(html=html)
+
+    def _find_worst_beam(self, results: list) -> Optional[dict]:
+        beams = [r for r in results if r.get('MemberType') == 'Beam'
+                 and r.get('Pass') not in ('ADDED', 'REMOVED')]
+        fails = [r for r in beams if r.get('Pass') == 'FAIL']
+        pool  = fails if fails else beams
+        if not pool:
+            return None
+
+        def score(r):
+            force_max = max(
+                (_numeric_pct(r.get(f'{c}_Pct', 0)) for c in FORCE_COMPONENTS),
+                default=0.0,
+            )
+            return max(force_max, _numeric_pct(r.get('PMM_Pct', 0)))
+
+        return max(pool, key=score)
 
     # -- CSV export ----------------------------------------------------------
 
