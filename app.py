@@ -607,7 +607,7 @@ class Controller(vkt.Controller):
 
     # -- Overview table (primary view) ---------------------------------------
 
-    @vkt.TableView('Overview', duration_guess=30)
+    @vkt.TableView('Overview', duration_guess=2)
     def results_table(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
@@ -658,7 +658,7 @@ class Controller(vkt.Controller):
 
     # -- Full detail table ---------------------------------------------------
 
-    @vkt.TableView('Full Detail', duration_guess=30)
+    @vkt.TableView('Full Detail', duration_guess=2)
     def results_detail(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
@@ -711,7 +711,7 @@ class Controller(vkt.Controller):
 
     # -- Plotly chart --------------------------------------------------------
 
-    @vkt.PlotlyView('Results Chart', duration_guess=30)
+    @vkt.PlotlyView('Results Chart', duration_guess=2)
     def results_chart(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
@@ -778,7 +778,7 @@ class Controller(vkt.Controller):
 
     # -- Summary table -------------------------------------------------------
 
-    @vkt.TableView('Summary by Story', duration_guess=30)
+    @vkt.TableView('Summary by Story', duration_guess=2)
     def summary_table(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
@@ -818,7 +818,7 @@ class Controller(vkt.Controller):
 
     # -- Key metrics DataView ------------------------------------------------
 
-    @vkt.DataView('Key Metrics', duration_guess=30)
+    @vkt.DataView('Key Metrics', duration_guess=2)
     def key_metrics(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
@@ -911,7 +911,7 @@ class Controller(vkt.Controller):
 
     # -- Beam detail HTML view -----------------------------------------------
 
-    @vkt.WebView('Beam Detail', duration_guess=30)
+    @vkt.WebView('Beam Detail', duration_guess=2)
     def beam_detail_view(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
