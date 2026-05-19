@@ -2,6 +2,12 @@ import re
 from typing import Optional
 
 import viktor as vkt
+from openai import OpenAI
+
+_llm_client = OpenAI(
+    base_url=vkt.ViktorOpenAI.get_base_url(version="v1"),
+    api_key=vkt.ViktorOpenAI.get_api_key(),
+)
 
 from comparison import (
     build_summary, results_to_csv, run_comparison, FORCE_COMPONENTS,
@@ -25,17 +31,13 @@ OVERVIEW_HEADERS = [
 
 DETAIL_HEADERS = [
     'Story', 'Label', 'Type',
-    'Section (Exist)', 'Section (New)',
-    'Gov Combo (Exist)', 'Gov Combo (New)', 'Load Type',
+    'Section', 'Gov Combo', 'Load Type',
     'P (Exist)', 'P (New)', 'P (%)',
     'V2 (Exist)', 'V2 (New)', 'V2 (%)',
     'V3 (Exist)', 'V3 (New)', 'V3 (%)',
-    'T (Exist)', 'T (New)', 'T (%)',
     'M2 (Exist)', 'M2 (New)', 'M2 (%)',
     'M3 (Exist)', 'M3 (New)', 'M3 (%)',
-    'PMM (Exist)', 'PMM (New)', 'PMM (%)',
-    'V Maj (Exist)', 'V Maj (New)', 'V Maj (%)',
-    'Sign Rev.', 'Fail Reason', 'Result',
+    'Fail Reason', 'Result',
 ]
 
 SUMMARY_HEADERS = ['Story', 'Type', 'Total', 'PASS', 'FAIL', 'ADDED', 'REMOVED']
@@ -243,6 +245,17 @@ Start with the **Overview** tab to spot failures quickly. Use **Full Detail** to
         longpoll=True,
     )
 
+    step2.section_ai = vkt.Section('AI Assistant')
+    step2.section_ai.chat = vkt.Chat(
+        'Ask about failures',
+        method='call_llm',
+        first_message=(
+            'I can see the comparison results for this model. '
+            'Ask me about which members failed, why they failed, '
+            'or what the most critical issues are.'
+        ),
+    )
+
 
 # ---------------------------------------------------------------------------
 # Diagnostics
@@ -317,7 +330,6 @@ def _render_beam_detail_html(beam: Optional[dict], gravity_thresh: float, latera
 
     banner_bg = '#B22222' if pass_val == 'FAIL' else '#228B22'
 
-    # Narrative sentence
     if pass_val == 'FAIL':
         result_phrase = '<span style="font-weight:bold">FAILED</span>'
         narrative = (
@@ -337,7 +349,6 @@ def _render_beam_detail_html(beam: Optional[dict], gravity_thresh: float, latera
     if sign_rev == 'YES':
         narrative += ' <span style="color:#B46400;font-weight:bold">&#9888; Sign reversal detected on at least one force component.</span>'
 
-    # Shared cell/row styles
     TH = 'padding:8px 12px;text-align:left;font-size:13px;border-bottom:2px solid #ccc;white-space:nowrap'
     TD = 'padding:7px 12px;font-size:13px;border-bottom:1px solid #e5e5e5'
 
@@ -530,24 +541,19 @@ class Controller(vkt.Controller):
 
         data = []
         for r in results:
+            section = r.get('DesignSection_New') or r.get('DesignSection_Exist', '')
             data.append([
                 r.get('Story', ''),
                 r.get('Label', ''),
                 r.get('MemberType', ''),
-                r.get('DesignSection_Exist', ''),
-                r.get('DesignSection_New', ''),
-                r.get('GovCombo_Exist', ''),
+                section,
                 r.get('GovCombo_New', ''),
                 r.get('LoadType', ''),
                 r.get('P_Exist', ''), r.get('P_New', ''), _fmt_pct(r.get('P_Pct', '')),
                 r.get('V2_Exist', ''), r.get('V2_New', ''), _fmt_pct(r.get('V2_Pct', '')),
                 r.get('V3_Exist', ''), r.get('V3_New', ''), _fmt_pct(r.get('V3_Pct', '')),
-                r.get('T_Exist', ''), r.get('T_New', ''), _fmt_pct(r.get('T_Pct', '')),
                 r.get('M2_Exist', ''), r.get('M2_New', ''), _fmt_pct(r.get('M2_Pct', '')),
                 r.get('M3_Exist', ''), r.get('M3_New', ''), _fmt_pct(r.get('M3_Pct', '')),
-                r.get('PMM_Exist', ''), r.get('PMM_New', ''), _fmt_pct(r.get('PMM_Pct', '')),
-                r.get('VMaj_Exist', ''), r.get('VMaj_New', ''), _fmt_pct(r.get('VMaj_Pct', '')),
-                r.get('SignReversal', ''),
                 r.get('FailReason', ''),
                 _result_cell(r.get('Pass', '')),
             ])
@@ -772,6 +778,69 @@ class Controller(vkt.Controller):
             raise vkt.UserError('Please upload both model files in Step 1.')
         results = self._run_all(params)
         return vkt.DownloadResult(results_to_csv(results), 'etabs_comparison_results.csv')
+
+    # -- LLM chat ------------------------------------------------------------
+
+    def call_llm(self, params, **kwargs):
+        import openai
+        conversation = params.step2.section_ai.chat
+        if not conversation:
+            return None
+
+        p = params.step2.section_options
+        gravity_thresh  = float(p.gravity_threshold or 5)
+        lateral_thresh  = float(p.lateral_threshold or 10)
+        all_results     = self._run_all(params)
+        failures        = [r for r in all_results if r.get('Pass') == 'FAIL']
+
+        failure_lines = []
+        for r in failures[:60]:
+            sect_change = (
+                f"{r.get('DesignSection_Exist')} → {r.get('DesignSection_New')}"
+                if r.get('DesignSection_Exist') != r.get('DesignSection_New')
+                else r.get('DesignSection_Exist', 'N/A')
+            )
+            failure_lines.append(
+                f"- {r['MemberType']} {r['Label']} (Story {r['Story']}): "
+                f"{r.get('FailReason', 'N/A')} | load type: {r.get('LoadType', 'N/A')} | "
+                f"section: {sect_change} | "
+                f"PMM: {r.get('PMM_Exist', 'N/A')} → {r.get('PMM_New', 'N/A')}"
+            )
+
+        failure_block = "\n".join(failure_lines) if failure_lines else "None — all members are passing."
+
+        system_prompt = (
+            f"You are a structural engineering assistant reviewing an ETABS model comparison "
+            f"for IBC Section 3403 compliance. The tool compares steel member demands between "
+            f"an existing building and a proposed modified model.\n\n"
+            f"Thresholds in use: gravity combos {gravity_thresh}%, lateral combos {lateral_thresh}%.\n"
+            f"Total members compared: {len(all_results)}. Failures: {len(failures)}.\n\n"
+            f"Failing members:\n{failure_block}\n\n"
+            f"Each failure line shows: member type, label, story, fail reason (which force/ratio "
+            f"exceeded the threshold and by how much), load type, section change, and PMM ratio change.\n\n"
+            f"Answer concisely in engineering terms. Reference specific members and stories. "
+            f"If asked about a member not in the failure list, note that it is passing."
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            *conversation.get_messages(),
+        ]
+
+        try:
+            stream = _llm_client.chat.completions.create(
+                model="openai.gpt-oss-120b",
+                messages=messages,
+                stream=True,
+            )
+            text_stream = (
+                chunk.choices[0].delta.content
+                for chunk in stream
+                if chunk.choices[0].delta.content is not None
+            )
+            return vkt.ChatResult(conversation, text_stream)
+        except openai.RateLimitError:
+            raise vkt.UserError("LLM rate limit reached — please wait a moment and try again.")
 
     # -- Shared helpers ------------------------------------------------------
 
