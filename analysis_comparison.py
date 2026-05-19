@@ -14,6 +14,7 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from comparison import _stream_etabs_rows, _pct_change, _fmt
+from storage_cache import get_cached, set_cached
 
 ANALYSIS_FORCES_SHEETS = {
     'Columns': 'Element Forces - Columns',
@@ -43,8 +44,7 @@ GOVERNING_FORCES = {
     'Braces':  ['P'],
 }
 
-_ANALYSIS_PARSE_CACHE: dict = {}
-_ANALYSIS_RESULTS_CACHE: dict = {}
+# Caching handled by storage_cache. Prefixes: 'etabs_aparse' / 'etabs_acmp'.
 
 
 # ---------------------------------------------------------------------------
@@ -106,30 +106,36 @@ def _get_parsed_analysis_file(file_obj) -> tuple:
     """Return (hash, parsed_dict), computing and caching on first call."""
     file_bytes = file_obj.getvalue_binary()
     h = hashlib.md5(file_bytes).hexdigest()
-    if h not in _ANALYSIS_PARSE_CACHE:
-        fh = io.BytesIO(file_bytes)
-        del file_bytes
+
+    cached = get_cached('etabs_aparse', h)
+    if cached is not None:
+        return h, cached
+
+    fh = io.BytesIO(file_bytes)
+    del file_bytes
+    try:
+        wb = load_workbook(fh, read_only=True, data_only=True)
         try:
-            wb = load_workbook(fh, read_only=True, data_only=True)
-            try:
-                _ANALYSIS_PARSE_CACHE[h] = {
-                    'forces': {
-                        mt: _parse_analysis_forces_from_wb(wb, mt)
-                        for mt in ('Columns', 'Beams', 'Braces')
-                    },
-                    'sheet_names': list(wb.sheetnames),
-                }
-            finally:
-                wb.close()
-        except Exception:
-            _ANALYSIS_PARSE_CACHE[h] = {
+            result = {
                 'forces': {
-                    mt: pd.DataFrame(columns=['Story', 'Label'] + ALL_FORCE_COMPONENTS)
+                    mt: _parse_analysis_forces_from_wb(wb, mt)
                     for mt in ('Columns', 'Beams', 'Braces')
                 },
-                'sheet_names': [],
+                'sheet_names': list(wb.sheetnames),
             }
-    return h, _ANALYSIS_PARSE_CACHE[h]
+        finally:
+            wb.close()
+    except Exception:
+        result = {
+            'forces': {
+                mt: pd.DataFrame(columns=['Story', 'Label'] + ALL_FORCE_COMPONENTS)
+                for mt in ('Columns', 'Beams', 'Braces')
+            },
+            'sheet_names': [],
+        }
+
+    set_cached('etabs_aparse', h, result)
+    return h, result
 
 
 # ---------------------------------------------------------------------------
@@ -273,13 +279,13 @@ def run_analysis_comparison(
     new_hash,   parsed_new   = _get_parsed_analysis_file(modified_file)
     cache_key = (exist_hash, new_hash, member_type_filter, warn_threshold, fail_threshold)
 
-    if cache_key not in _ANALYSIS_RESULTS_CACHE:
-        _ANALYSIS_RESULTS_CACHE[cache_key] = _run_analysis_internal(
+    all_results = get_cached('etabs_acmp', cache_key)
+    if all_results is None:
+        all_results = _run_analysis_internal(
             parsed_exist, parsed_new,
             member_type_filter, warn_threshold, fail_threshold,
         )
-
-    all_results = _ANALYSIS_RESULTS_CACHE[cache_key]
+        set_cached('etabs_acmp', cache_key, all_results)
 
     if show_failures_only:
         return [r for r in all_results if r.get('Pass') in ('FAIL', 'WARN')]

@@ -16,6 +16,8 @@ from collections import defaultdict
 import pandas as pd
 from openpyxl import load_workbook
 
+from storage_cache import get_cached, set_cached
+
 FORCE_COMPONENTS = ['P', 'V2', 'V3', 'T', 'M2', 'M3']
 
 DESIGN_FORCES_SHEETS = {
@@ -46,15 +48,8 @@ DESIGN_TYPE = {
 LATERAL_RE = re.compile(r'(?<![A-Za-z])([EW][A-Za-z]+)(?![A-Za-z])')
 
 
-# ---------------------------------------------------------------------------
-# Module-level caches
-# ---------------------------------------------------------------------------
-
-# file_hash → {'summary': DataFrame, 'forces': {'Columns': df, 'Beams': df, 'Braces': df}}
-_PARSE_CACHE: dict = {}
-
-# (exist_hash, new_hash, member_type_filter, gravity_threshold, lateral_threshold) → list[dict]
-_RESULTS_CACHE: dict = {}
+# Caching is handled by storage_cache (two-level: in-process + Viktor Storage).
+# Prefixes: 'etabs_parse' for parsed workbook data, 'etabs_cmp' for comparison results.
 
 
 # ---------------------------------------------------------------------------
@@ -269,32 +264,38 @@ def _get_parsed_file(file_obj) -> tuple:
     """
     file_bytes = file_obj.getvalue_binary()
     h = hashlib.md5(file_bytes).hexdigest()
-    if h not in _PARSE_CACHE:
-        fh = io.BytesIO(file_bytes)
-        del file_bytes          # release raw bytes — BytesIO holds its own copy
+
+    cached = get_cached('etabs_parse', h)
+    if cached is not None:
+        return h, cached
+
+    fh = io.BytesIO(file_bytes)
+    del file_bytes
+    try:
+        wb = load_workbook(fh, read_only=True, data_only=True)
         try:
-            wb = load_workbook(fh, read_only=True, data_only=True)
-            try:
-                _PARSE_CACHE[h] = {
-                    'summary': _parse_summary_from_wb(wb),
-                    'forces': {
-                        mt: _parse_forces_from_wb(wb, mt)
-                        for mt in ('Columns', 'Beams', 'Braces')
-                    },
-                    'sheet_names': list(wb.sheetnames),
-                }
-            finally:
-                wb.close()
-        except Exception:
-            _PARSE_CACHE[h] = {
-                'summary': pd.DataFrame(),
+            result = {
+                'summary': _parse_summary_from_wb(wb),
                 'forces': {
-                    mt: pd.DataFrame(columns=['Story', 'Label'] + FORCE_COMPONENTS)
+                    mt: _parse_forces_from_wb(wb, mt)
                     for mt in ('Columns', 'Beams', 'Braces')
                 },
-                'sheet_names': [],
+                'sheet_names': list(wb.sheetnames),
             }
-    return h, _PARSE_CACHE[h]
+        finally:
+            wb.close()
+    except Exception:
+        result = {
+            'summary': pd.DataFrame(),
+            'forces': {
+                mt: pd.DataFrame(columns=['Story', 'Label'] + FORCE_COMPONENTS)
+                for mt in ('Columns', 'Beams', 'Braces')
+            },
+            'sheet_names': [],
+        }
+
+    set_cached('etabs_parse', h, result)
+    return h, result
 
 
 # ---------------------------------------------------------------------------
@@ -622,13 +623,13 @@ def run_comparison(
     cache_key  = (exist_hash, new_hash, member_type_filter,
                   gravity_threshold, lateral_threshold)
 
-    if cache_key not in _RESULTS_CACHE:
-        _RESULTS_CACHE[cache_key] = _run_comparison_internal(
+    all_results = get_cached('etabs_cmp', cache_key)
+    if all_results is None:
+        all_results = _run_comparison_internal(
             parsed_exist, parsed_new,
             member_type_filter, gravity_threshold, lateral_threshold,
         )
-
-    all_results = _RESULTS_CACHE[cache_key]
+        set_cached('etabs_cmp', cache_key, all_results)
 
     if show_failures_only:
         return [r for r in all_results if r.get('Pass') == 'FAIL']
