@@ -13,6 +13,9 @@ from comparison import (
     build_summary, results_to_csv, run_comparison, FORCE_COMPONENTS,
     DESIGN_FORCES_SHEETS, _get_parsed_file,
 )
+from analysis_comparison import (
+    run_analysis_comparison, ANALYSIS_FORCES_SHEETS, _get_parsed_analysis_file,
+)
 
 # ---------------------------------------------------------------------------
 # Column headers
@@ -41,6 +44,21 @@ DETAIL_HEADERS = [
 ]
 
 SUMMARY_HEADERS = ['Story', 'Type', 'Total', 'PASS', 'WARN', 'FAIL', 'ADDED', 'REMOVED']
+
+ANALYSIS_OVERVIEW_HEADERS = [
+    'Story', 'Label', 'Type',
+    'P (%)', 'V2 (%)', 'M2 (%)', 'M3 (%)',
+    'Worst (%)', 'Fail Reason', 'Result',
+]
+
+ANALYSIS_DETAIL_HEADERS = [
+    'Story', 'Label', 'Type',
+    'P (Exist)', 'P (New)', 'P (%)',
+    'V2 (Exist)', 'V2 (New)', 'V2 (%)',
+    'M2 (Exist)', 'M2 (New)', 'M2 (%)',
+    'M3 (Exist)', 'M3 (New)', 'M3 (%)',
+    'Worst (%)', 'Fail Reason', 'Result',
+]
 
 # ---------------------------------------------------------------------------
 # Colors
@@ -173,22 +191,32 @@ class Parametrization(vkt.Parametrization):
     step1 = vkt.Step('Upload Files', on_next=validate_step1)
 
     step1.intro = vkt.Text("""
-## Upload ETABS Design Output Exports
+## Upload ETABS Output Exports
 
 Upload two ETABS Excel exports (.xlsx) — one for the **existing** model and
-one for the **modified** (repurposed) model.
+one for the **modified** (repurposed) model. Select the result type below to
+match the tables you exported.
 
-**How to export from ETABS:**
-1. Run the steel frame design for both models.
-2. Go to *Display > Show Tables*, select **Design** tables.
-3. Export: *Design Forces - Columns*, *Design Forces - Beams*,
-   *Design Forces - Braces*, and *Steel Frame Design Summary - AISC 360-16*
-   to a single Excel workbook.
+**Design Results** — post-design-run tables. Export: *Design Forces - Columns*,
+*Design Forces - Beams*, *Design Forces - Braces*, and *Steel Frame Design
+Summary - AISC 360-16* to a single workbook. Compares PMM/shear D/C ratios
+and force envelopes; classifies combos as gravity or lateral for IBC 3403.
 
-Each file must contain those four sheets. The first run will take
-~1–2 minutes to parse the data; subsequent tab switches and threshold
-changes will be near-instant.
+**Analysis Results** — pre-design element force tables. Export: *Element
+Forces - Columns*, *Element Forces - Beams*, *Element Forces - Braces* to a
+single workbook. Compares max-absolute force envelopes (P, M3/M2, V2) against
+a single adjustable threshold.
+
+The first run will take ~1–2 minutes to parse; subsequent tab switches are
+near-instant.
 """)
+
+    step1.mode = vkt.OptionField(
+        'Result Type',
+        options=['Design Results', 'Analysis Results'],
+        default='Design Results',
+        description='Match this to the ETABS tables you exported',
+    )
 
     step1.existing_file = vkt.FileField(
         'Existing Model (.xlsx)',
@@ -264,16 +292,28 @@ Start with the **Overview** tab to spot failures quickly. Use **Full Detail** to
         default='All',
     )
     step2.section_options.gravity_threshold = vkt.NumberField(
-        'Gravity Load Threshold (%)',
+        'Gravity Load Threshold — Design mode (%)',
         default=5,
         min=0,
         description='Maximum allowable % increase for gravity combos (IBC 3403)',
     )
     step2.section_options.lateral_threshold = vkt.NumberField(
-        'Lateral Load Threshold (%)',
+        'Lateral Load Threshold — Design mode (%)',
         default=10,
         min=0,
         description='Maximum allowable % increase for lateral combos (IBC 3403)',
+    )
+    step2.section_options.warn_threshold = vkt.NumberField(
+        'Warn Threshold — Analysis mode (%)',
+        default=5,
+        min=0,
+        description='Force increase above this triggers WARN',
+    )
+    step2.section_options.fail_threshold = vkt.NumberField(
+        'Fail Threshold — Analysis mode (%)',
+        default=10,
+        min=0,
+        description='Force increase above this triggers FAIL',
     )
     step2.section_options.display_filter = vkt.OptionField(
         'Display Filter',
@@ -331,6 +371,31 @@ def _no_results_message(params) -> str:
             f'Forces sheets parsed but returned 0 rows.\n'
             f'Existing: {e_counts}\nModified: {n_counts}'
         )
+
+    return (
+        'No results to display. If "Failures Only" is selected, '
+        'all members may be passing. Try switching to "All Results".'
+    )
+
+
+def _no_results_message_analysis(params) -> str:
+    _, pe = _get_parsed_analysis_file(params.step1.existing_file.file)
+    _, pn = _get_parsed_analysis_file(params.step1.modified_file.file)
+
+    e_sheets = pe.get('sheet_names', [])
+    n_sheets = pn.get('sheet_names', [])
+
+    expected = list(ANALYSIS_FORCES_SHEETS.values())
+    e_missing = [s for s in expected if s not in e_sheets]
+    n_missing = [s for s in expected if s not in n_sheets]
+
+    if e_missing or n_missing:
+        lines = [f'No members found. Expected sheets: {expected}']
+        if e_missing:
+            lines.append(f'Existing file missing: {e_missing}  (found: {e_sheets})')
+        if n_missing:
+            lines.append(f'Modified file missing: {n_missing}  (found: {n_sheets})')
+        return '\n'.join(lines)
 
     return (
         'No results to display. If "Failures Only" is selected, '
@@ -547,6 +612,26 @@ class Controller(vkt.Controller):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
 
+        if (params.step1.mode or 'Design Results') == 'Analysis Results':
+            results = self._run_analysis(params)
+            if not results:
+                raise vkt.UserError(_no_results_message_analysis(params))
+            data = []
+            for r in results:
+                data.append([
+                    r.get('Story', ''),
+                    r.get('Label', ''),
+                    r.get('MemberType', ''),
+                    _fmt_pct(r.get('P_Pct', '')),
+                    _fmt_pct(r.get('V2_Pct', '')),
+                    _fmt_pct(r.get('M2_Pct', '')),
+                    _fmt_pct(r.get('M3_Pct', '')),
+                    _fmt_pct(r.get('WorstPct', '')),
+                    r.get('FailReason', ''),
+                    _result_cell(r.get('Pass', '')),
+                ])
+            return vkt.TableResult(data, column_headers=ANALYSIS_OVERVIEW_HEADERS)
+
         results = self._run(params)
         if not results:
             raise vkt.UserError(_no_results_message(params))
@@ -577,6 +662,26 @@ class Controller(vkt.Controller):
     def results_detail(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
+
+        if (params.step1.mode or 'Design Results') == 'Analysis Results':
+            results = self._run_analysis(params)
+            if not results:
+                raise vkt.UserError(_no_results_message_analysis(params))
+            data = []
+            for r in results:
+                data.append([
+                    r.get('Story', ''),
+                    r.get('Label', ''),
+                    r.get('MemberType', ''),
+                    r.get('P_Exist', ''), r.get('P_New', ''), _fmt_pct(r.get('P_Pct', '')),
+                    r.get('V2_Exist', ''), r.get('V2_New', ''), _fmt_pct(r.get('V2_Pct', '')),
+                    r.get('M2_Exist', ''), r.get('M2_New', ''), _fmt_pct(r.get('M2_Pct', '')),
+                    r.get('M3_Exist', ''), r.get('M3_New', ''), _fmt_pct(r.get('M3_Pct', '')),
+                    _fmt_pct(r.get('WorstPct', '')),
+                    r.get('FailReason', ''),
+                    _result_cell(r.get('Pass', '')),
+                ])
+            return vkt.TableResult(data, column_headers=ANALYSIS_DETAIL_HEADERS)
 
         results = self._run(params)
         if not results:
@@ -611,7 +716,8 @@ class Controller(vkt.Controller):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
 
-        all_results = self._run_all(params)
+        mode = params.step1.mode or 'Design Results'
+        all_results = self._run_analysis_all(params) if mode == 'Analysis Results' else self._run_all(params)
         if not all_results:
             raise vkt.UserError('No data to chart.')
 
@@ -677,7 +783,9 @@ class Controller(vkt.Controller):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
 
-        summary = build_summary(self._run_all(params))
+        mode = params.step1.mode or 'Design Results'
+        all_results = self._run_analysis_all(params) if mode == 'Analysis Results' else self._run_all(params)
+        summary = build_summary(all_results)
         if not summary:
             raise vkt.UserError('No data to summarise.')
 
@@ -715,7 +823,8 @@ class Controller(vkt.Controller):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
 
-        all_results = self._run_all(params)
+        mode = params.step1.mode or 'Design Results'
+        all_results = self._run_analysis_all(params) if mode == 'Analysis Results' else self._run_all(params)
         if not all_results:
             raise vkt.UserError('No data.')
 
@@ -729,21 +838,10 @@ class Controller(vkt.Controller):
         n_warn   = len(warnings)
         fail_rate = round(n_fail / total * 100, 1) if total > 0 else 0.0
 
-        # Worst PMM change among matched members
-        worst_pmm_pct = None
-        worst_pmm_label = ''
-        for r in all_results:
-            pct = r.get('PMM_Pct')
-            if isinstance(pct, float) and (worst_pmm_pct is None or pct > worst_pmm_pct):
-                worst_pmm_pct = pct
-                worst_pmm_label = f"{r.get('Story')} / {r.get('Label')}"
-
-        # Most affected story
         story_fail_counts = Counter(r.get('Story') for r in failures)
-        if story_fail_counts:
-            top_story, top_count = story_fail_counts.most_common(1)[0]
-        else:
-            top_story, top_count = 'None', 0
+        top_story, top_count = (
+            story_fail_counts.most_common(1)[0] if story_fail_counts else ('None', 0)
+        )
 
         fail_status = vkt.DataStatus.ERROR if n_fail > 0 else vkt.DataStatus.SUCCESS
         rate_status = (
@@ -751,55 +849,64 @@ class Controller(vkt.Controller):
             vkt.DataStatus.WARNING if fail_rate > 0  else
             vkt.DataStatus.SUCCESS
         )
-        pmm_status = (
-            vkt.DataStatus.ERROR if (worst_pmm_pct or 0) > 10 else
-            vkt.DataStatus.WARNING if (worst_pmm_pct or 0) > 0 else
-            vkt.DataStatus.INFO
-        )
 
-        data = vkt.DataGroup(
-            vkt.DataItem('Total Members Compared', total),
-            vkt.DataItem(
-                'Failures',
-                n_fail,
-                status=fail_status,
-                status_message=(
-                    'Members exceeding IBC 3403 thresholds'
-                    if n_fail > 0 else 'All members within threshold'
-                ),
-            ),
-            vkt.DataItem(
-                'Failure Rate',
-                fail_rate,
-                suffix='%',
-                number_of_decimals=1,
-                status=rate_status,
-            ),
-            vkt.DataItem(
-                'Warnings',
-                n_warn,
-                status=vkt.DataStatus.WARNING if n_warn > 0 else vkt.DataStatus.SUCCESS,
-                status_message=(
-                    'Failed only on INF while primary forces decreased — review but likely acceptable'
-                    if n_warn > 0 else 'No warnings'
-                ),
-            ),
-            vkt.DataItem('Added Members', len(added)),
-            vkt.DataItem('Removed Members', len(removed)),
-            vkt.DataItem(
-                'Worst PMM Change',
-                worst_pmm_pct if worst_pmm_pct is not None else 0.0,
-                suffix='%',
-                number_of_decimals=1,
-                status=pmm_status,
-                explanation_label=worst_pmm_label,
-            ),
-            vkt.DataItem(
-                'Most Affected Story',
-                top_story,
-                explanation_label=f'{top_count} failures',
-            ),
-        )
+        if mode == 'Analysis Results':
+            p = params.step2.section_options
+            fail_thresh = float(p.fail_threshold or 10)
+            worst_force_pct  = None
+            worst_force_label = ''
+            for r in all_results:
+                pct = r.get('WorstPct')
+                if isinstance(pct, float) and (worst_force_pct is None or pct > worst_force_pct):
+                    worst_force_pct  = pct
+                    worst_force_label = f"{r.get('Story')} / {r.get('Label')}"
+            worst_status = (
+                vkt.DataStatus.ERROR   if (worst_force_pct or 0) > fail_thresh else
+                vkt.DataStatus.WARNING if (worst_force_pct or 0) > 0           else
+                vkt.DataStatus.INFO
+            )
+            data = vkt.DataGroup(
+                vkt.DataItem('Total Members Compared', total),
+                vkt.DataItem('Failures', n_fail, status=fail_status,
+                             status_message='Members exceeding fail threshold' if n_fail > 0 else 'All members within threshold'),
+                vkt.DataItem('Failure Rate', fail_rate, suffix='%', number_of_decimals=1, status=rate_status),
+                vkt.DataItem('Warnings', n_warn,
+                             status=vkt.DataStatus.WARNING if n_warn > 0 else vkt.DataStatus.SUCCESS),
+                vkt.DataItem('Added Members', len(added)),
+                vkt.DataItem('Removed Members', len(removed)),
+                vkt.DataItem('Worst Force Change', worst_force_pct if worst_force_pct is not None else 0.0,
+                             suffix='%', number_of_decimals=1, status=worst_status,
+                             explanation_label=worst_force_label),
+                vkt.DataItem('Most Affected Story', top_story, explanation_label=f'{top_count} failures'),
+            )
+        else:
+            worst_pmm_pct = None
+            worst_pmm_label = ''
+            for r in all_results:
+                pct = r.get('PMM_Pct')
+                if isinstance(pct, float) and (worst_pmm_pct is None or pct > worst_pmm_pct):
+                    worst_pmm_pct  = pct
+                    worst_pmm_label = f"{r.get('Story')} / {r.get('Label')}"
+            pmm_status = (
+                vkt.DataStatus.ERROR   if (worst_pmm_pct or 0) > 10 else
+                vkt.DataStatus.WARNING if (worst_pmm_pct or 0) > 0  else
+                vkt.DataStatus.INFO
+            )
+            data = vkt.DataGroup(
+                vkt.DataItem('Total Members Compared', total),
+                vkt.DataItem('Failures', n_fail, status=fail_status,
+                             status_message='Members exceeding IBC 3403 thresholds' if n_fail > 0 else 'All members within threshold'),
+                vkt.DataItem('Failure Rate', fail_rate, suffix='%', number_of_decimals=1, status=rate_status),
+                vkt.DataItem('Warnings', n_warn,
+                             status=vkt.DataStatus.WARNING if n_warn > 0 else vkt.DataStatus.SUCCESS,
+                             status_message='Failed only on INF while primary forces decreased — review but likely acceptable' if n_warn > 0 else 'No warnings'),
+                vkt.DataItem('Added Members', len(added)),
+                vkt.DataItem('Removed Members', len(removed)),
+                vkt.DataItem('Worst PMM Change', worst_pmm_pct if worst_pmm_pct is not None else 0.0,
+                             suffix='%', number_of_decimals=1, status=pmm_status,
+                             explanation_label=worst_pmm_label),
+                vkt.DataItem('Most Affected Story', top_story, explanation_label=f'{top_count} failures'),
+            )
         return vkt.DataResult(data)
 
     # -- Beam detail HTML view -----------------------------------------------
@@ -808,6 +915,14 @@ class Controller(vkt.Controller):
     def beam_detail_view(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
+
+        if (params.step1.mode or 'Design Results') == 'Analysis Results':
+            html = (
+                '<p style="font-family:sans-serif;padding:24px;color:#555;font-size:15px;">'
+                'Beam detail view is only available in Design mode.'
+                '</p>'
+            )
+            return vkt.WebResult(html=html)
 
         p = params.step2.section_options
         gravity_thresh  = float(p.gravity_threshold or 5)
@@ -840,7 +955,8 @@ class Controller(vkt.Controller):
     def download_csv(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
-        results = self._run_all(params)
+        mode = params.step1.mode or 'Design Results'
+        results = self._run_analysis_all(params) if mode == 'Analysis Results' else self._run_all(params)
         return vkt.DownloadResult(results_to_csv(results), 'etabs_comparison_results.csv')
 
     # -- LLM chat ------------------------------------------------------------
@@ -934,3 +1050,27 @@ class Controller(vkt.Controller):
             show_failures_only=False,
         )
         return _postprocess_results(results)
+
+    def _run_analysis(self, params):
+        """Filtered analysis results."""
+        p = params.step2.section_options
+        return run_analysis_comparison(
+            existing_file=params.step1.existing_file.file,
+            modified_file=params.step1.modified_file.file,
+            member_type_filter=p.member_type or 'All',
+            warn_threshold=float(p.warn_threshold or 5),
+            fail_threshold=float(p.fail_threshold or 10),
+            show_failures_only=(p.display_filter == 'Failures Only'),
+        )
+
+    def _run_analysis_all(self, params):
+        """Unfiltered analysis results — used by chart, summary, key metrics, and CSV."""
+        p = params.step2.section_options
+        return run_analysis_comparison(
+            existing_file=params.step1.existing_file.file,
+            modified_file=params.step1.modified_file.file,
+            member_type_filter=p.member_type or 'All',
+            warn_threshold=float(p.warn_threshold or 5),
+            fail_threshold=float(p.fail_threshold or 10),
+            show_failures_only=False,
+        )
