@@ -640,13 +640,13 @@ def build_summary(results: list) -> list:
     Group results by MemberType and Story; count PASS/FAIL/ADDED/REMOVED.
     Returns list of row dicts: Story, MemberType, Total, PASS, FAIL, ADDED, REMOVED.
     """
-    counts = defaultdict(lambda: {'Total': 0, 'PASS': 0, 'FAIL': 0, 'ADDED': 0, 'REMOVED': 0})
+    counts = defaultdict(lambda: {'Total': 0, 'PASS': 0, 'WARN': 0, 'FAIL': 0, 'ADDED': 0, 'REMOVED': 0})
 
     for r in results:
         key = (r.get('Story', ''), r.get('MemberType', ''))
         counts[key]['Total'] += 1
         status = r.get('Pass', '')
-        if status in ('PASS', 'FAIL', 'ADDED', 'REMOVED'):
+        if status in ('PASS', 'WARN', 'FAIL', 'ADDED', 'REMOVED'):
             counts[key][status] += 1
 
     summary = []
@@ -656,6 +656,7 @@ def build_summary(results: list) -> list:
             'MemberType': mtype,
             'Total':      c['Total'],
             'PASS':       c['PASS'],
+            'WARN':       c['WARN'],
             'FAIL':       c['FAIL'],
             'ADDED':      c['ADDED'],
             'REMOVED':    c['REMOVED'],

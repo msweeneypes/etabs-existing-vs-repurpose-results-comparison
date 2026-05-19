@@ -37,10 +37,10 @@ DETAIL_HEADERS = [
     'V3 (Exist)', 'V3 (New)', 'V3 (%)',
     'M2 (Exist)', 'M2 (New)', 'M2 (%)',
     'M3 (Exist)', 'M3 (New)', 'M3 (%)',
-    'Fail Reason', 'Result',
+    'Net Demand', 'Fail Reason', 'Result',
 ]
 
-SUMMARY_HEADERS = ['Story', 'Type', 'Total', 'PASS', 'FAIL', 'ADDED', 'REMOVED']
+SUMMARY_HEADERS = ['Story', 'Type', 'Total', 'PASS', 'WARN', 'FAIL', 'ADDED', 'REMOVED']
 
 # ---------------------------------------------------------------------------
 # Colors
@@ -49,12 +49,14 @@ SUMMARY_HEADERS = ['Story', 'Type', 'Total', 'PASS', 'FAIL', 'ADDED', 'REMOVED']
 _RESULT_COLORS = {
     'PASS':    vkt.Color(34, 139, 34),
     'FAIL':    vkt.Color(178, 34, 34),
+    'WARN':    vkt.Color(180, 130, 0),
     'ADDED':   vkt.Color(30, 100, 200),
     'REMOVED': vkt.Color(180, 100, 0),
 }
 
 _CHART_COLORS = {
     'FAIL':    '#B22222',
+    'WARN':    '#B48200',
     'PASS':    '#228B22',
     'ADDED':   '#1E64C8',
     'REMOVED': '#B46400',
@@ -90,6 +92,47 @@ def _worst_force_pct(row: dict) -> str:
     worst = max(vals)
     sign = '+' if worst >= 0 else ''
     return f'{sign}{worst:.1f}%'
+
+
+def _net_demand(r: dict) -> str:
+    """UP / DOWN / MIXED based on direction of primary force changes (excludes INF)."""
+    if r.get('Pass') in ('ADDED', 'REMOVED'):
+        return 'N/A'
+    pcts = [
+        r.get('P_Pct'), r.get('V2_Pct'), r.get('V3_Pct'),
+        r.get('M2_Pct'), r.get('M3_Pct'), r.get('PMM_Pct'),
+    ]
+    numeric = [p for p in pcts if isinstance(p, float)]
+    if not numeric:
+        return 'N/A'
+    if all(p <= 0 for p in numeric):
+        return 'DOWN'
+    if all(p > 0 for p in numeric):
+        return 'UP'
+    return 'MIXED'
+
+
+_CAPACITY_WARN_THRESHOLD = 0.95  # PMM below this + FAIL → WARN (member still under capacity)
+
+
+def _postprocess_results(results: list) -> list:
+    """Add NetDemand; downgrade FAIL → WARN for two conditions:
+    1. All numeric forces decreased (INF-only failure on previously-zero component).
+    2. Threshold exceeded but modified PMM D/C ratio is still < 0.95 (below capacity).
+    """
+    out = []
+    for r in results:
+        r = dict(r)
+        nd = _net_demand(r)
+        r['NetDemand'] = nd
+        if r.get('Pass') == 'FAIL':
+            pmm_new = r.get('PMM_New')
+            forces_down = nd == 'DOWN'
+            below_capacity = isinstance(pmm_new, float) and pmm_new < _CAPACITY_WARN_THRESHOLD
+            if forces_down or below_capacity:
+                r['Pass'] = 'WARN'
+        out.append(r)
+    return out
 
 
 def _story_sort_key(name: str) -> tuple:
@@ -554,6 +597,7 @@ class Controller(vkt.Controller):
                 r.get('V3_Exist', ''), r.get('V3_New', ''), _fmt_pct(r.get('V3_Pct', '')),
                 r.get('M2_Exist', ''), r.get('M2_New', ''), _fmt_pct(r.get('M2_Pct', '')),
                 r.get('M3_Exist', ''), r.get('M3_New', ''), _fmt_pct(r.get('M3_Pct', '')),
+                r.get('NetDemand', ''),
                 r.get('FailReason', ''),
                 _result_cell(r.get('Pass', '')),
             ])
@@ -640,6 +684,7 @@ class Controller(vkt.Controller):
         data = []
         for s in summary:
             fail_count = s['FAIL']
+            warn_count = s['WARN']
             fail_cell = vkt.TableCell(
                 str(fail_count),
                 background_color=(
@@ -648,9 +693,17 @@ class Controller(vkt.Controller):
                 ),
                 text_color=vkt.Color(255, 255, 255),
             )
+            warn_cell = vkt.TableCell(
+                str(warn_count),
+                background_color=(
+                    vkt.Color(180, 130, 0) if warn_count > 0
+                    else vkt.Color(34, 139, 34)
+                ),
+                text_color=vkt.Color(255, 255, 255),
+            )
             data.append([
                 s['Story'], s['MemberType'], s['Total'],
-                s['PASS'], fail_cell, s['ADDED'], s['REMOVED'],
+                s['PASS'], warn_cell, fail_cell, s['ADDED'], s['REMOVED'],
             ])
 
         return vkt.TableResult(data, column_headers=SUMMARY_HEADERS)
@@ -669,9 +722,11 @@ class Controller(vkt.Controller):
         from collections import Counter
         total    = len(all_results)
         failures = [r for r in all_results if r.get('Pass') == 'FAIL']
+        warnings = [r for r in all_results if r.get('Pass') == 'WARN']
         added    = [r for r in all_results if r.get('Pass') == 'ADDED']
         removed  = [r for r in all_results if r.get('Pass') == 'REMOVED']
         n_fail   = len(failures)
+        n_warn   = len(warnings)
         fail_rate = round(n_fail / total * 100, 1) if total > 0 else 0.0
 
         # Worst PMM change among matched members
@@ -719,6 +774,15 @@ class Controller(vkt.Controller):
                 suffix='%',
                 number_of_decimals=1,
                 status=rate_status,
+            ),
+            vkt.DataItem(
+                'Warnings',
+                n_warn,
+                status=vkt.DataStatus.WARNING if n_warn > 0 else vkt.DataStatus.SUCCESS,
+                status_message=(
+                    'Failed only on INF while primary forces decreased — review but likely acceptable'
+                    if n_warn > 0 else 'No warnings'
+                ),
             ),
             vkt.DataItem('Added Members', len(added)),
             vkt.DataItem('Removed Members', len(removed)),
@@ -791,7 +855,7 @@ class Controller(vkt.Controller):
         gravity_thresh  = float(p.gravity_threshold or 5)
         lateral_thresh  = float(p.lateral_threshold or 10)
         all_results     = self._run_all(params)
-        failures        = [r for r in all_results if r.get('Pass') == 'FAIL']
+        failures        = [r for r in all_results if r.get('Pass') in ('FAIL', 'WARN')]
 
         failure_lines = []
         for r in failures[:60]:
@@ -800,10 +864,11 @@ class Controller(vkt.Controller):
                 if r.get('DesignSection_Exist') != r.get('DesignSection_New')
                 else r.get('DesignSection_Exist', 'N/A')
             )
+            status = r.get('Pass', 'FAIL')
             failure_lines.append(
-                f"- {r['MemberType']} {r['Label']} (Story {r['Story']}): "
-                f"{r.get('FailReason', 'N/A')} | load type: {r.get('LoadType', 'N/A')} | "
-                f"section: {sect_change} | "
+                f"- [{status}] {r['MemberType']} {r['Label']} (Story {r['Story']}): "
+                f"{r.get('FailReason', 'N/A')} | net demand: {r.get('NetDemand', 'N/A')} | "
+                f"load type: {r.get('LoadType', 'N/A')} | section: {sect_change} | "
                 f"PMM: {r.get('PMM_Exist', 'N/A')} → {r.get('PMM_New', 'N/A')}"
             )
 
@@ -847,7 +912,7 @@ class Controller(vkt.Controller):
     def _run(self, params):
         """Filtered results (respects display_filter param)."""
         p = params.step2.section_options
-        return run_comparison(
+        results = run_comparison(
             existing_file=params.step1.existing_file.file,
             modified_file=params.step1.modified_file.file,
             member_type_filter=p.member_type or 'All',
@@ -855,11 +920,12 @@ class Controller(vkt.Controller):
             lateral_threshold=float(p.lateral_threshold or 10),
             show_failures_only=(p.display_filter == 'Failures Only'),
         )
+        return _postprocess_results(results)
 
     def _run_all(self, params):
         """Unfiltered results — used by chart, summary, key metrics, and CSV."""
         p = params.step2.section_options
-        return run_comparison(
+        results = run_comparison(
             existing_file=params.step1.existing_file.file,
             modified_file=params.step1.modified_file.file,
             member_type_filter=p.member_type or 'All',
@@ -867,3 +933,4 @@ class Controller(vkt.Controller):
             lateral_threshold=float(p.lateral_threshold or 10),
             show_failures_only=False,
         )
+        return _postprocess_results(results)
