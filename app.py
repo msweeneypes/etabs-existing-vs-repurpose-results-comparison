@@ -338,8 +338,13 @@ Start with the **Braces**, **Columns**, or **Beams** tab for focused review. Eac
         default=True,
         description=(
             'When checked, members where all governing forces decreased are excluded '
-            'from the Braces / Columns / Beams tabs. ADDED and REMOVED rows are always shown.'
+            'from the Braces / Columns / Beams tabs.'
         ),
+    )
+    step2.section_options.show_added_removed = vkt.BooleanField(
+        'Show added / removed members',
+        default=True,
+        description='When checked, members that exist only in one model appear in the typed tabs.',
     )
     step2.section_options.display_filter = vkt.OptionField(
         'Display Filter',
@@ -1293,9 +1298,10 @@ class Controller(vkt.Controller):
         """
         p = params.step2.section_options
         mode = params.step1.mode or 'Design Results'
-        abs_threshold  = float(p.abs_threshold if p.abs_threshold is not None else 5.0)
-        hide_decreases = p.hide_decreases if p.hide_decreases is not None else True
-        display_filter = p.display_filter or 'Failures Only'
+        abs_threshold      = float(p.abs_threshold if p.abs_threshold is not None else 5.0)
+        hide_decreases     = p.hide_decreases if p.hide_decreases is not None else True
+        show_added_removed = p.show_added_removed if p.show_added_removed is not None else True
+        display_filter     = p.display_filter or 'Failures Only'
 
         all_results = (
             self._run_analysis_all(params)
@@ -1312,6 +1318,9 @@ class Controller(vkt.Controller):
                 continue
 
             status = r.get('Pass', '')
+
+            if status in ('ADDED', 'REMOVED') and not show_added_removed:
+                continue
 
             # Absolute threshold — skip if all governing forces are negligible
             if status not in ('ADDED', 'REMOVED'):
