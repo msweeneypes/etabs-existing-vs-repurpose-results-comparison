@@ -323,15 +323,35 @@ Start with the **Braces**, **Columns**, or **Beams** tab for focused review. Eac
         min=0,
         description='Force increase above this triggers FLAG',
     )
-    step2.section_options.abs_threshold = vkt.NumberField(
-        'Absolute Force Threshold (kips / kip-ft)',
+    step2.section_options.thresh_P = vkt.NumberField(
+        'Min |P| to show (kips)',
         default=5.0,
         min=0,
-        description=(
-            'Members whose governing forces are all below this magnitude are excluded '
-            'from the typed tabs regardless of % change. Eliminates sign-reversal noise '
-            'on low-demand members.'
-        ),
+        description='Members are excluded from Braces/Columns tabs if |P| stays below this in both models.',
+    )
+    step2.section_options.thresh_M3 = vkt.NumberField(
+        'Min |M3| to show (kip-ft)',
+        default=20.0,
+        min=0,
+        description='Members are excluded from Beams/Columns tabs if |M3| stays below this in both models.',
+    )
+    step2.section_options.thresh_M2 = vkt.NumberField(
+        'Min |M2| to show (kip-ft)',
+        default=10.0,
+        min=0,
+        description='Members are excluded from Columns tabs if |M2| stays below this in both models.',
+    )
+    step2.section_options.thresh_V2 = vkt.NumberField(
+        'Min |V2| to show (kips)',
+        default=5.0,
+        min=0,
+        description='Members are excluded from Beams tabs if |V2| stays below this in both models.',
+    )
+    step2.section_options.thresh_V3 = vkt.NumberField(
+        'Min |V3| to show (kips)',
+        default=0.0,
+        min=0,
+        description='Members are excluded from Columns tabs if |V3| stays below this in both models. Set to 0 to disable.',
     )
     step2.section_options.hide_decreases = vkt.BooleanField(
         'Hide members where demand decreased',
@@ -1298,7 +1318,13 @@ class Controller(vkt.Controller):
         """
         p = params.step2.section_options
         mode = params.step1.mode or 'Design Results'
-        abs_threshold      = float(p.abs_threshold if p.abs_threshold is not None else 5.0)
+        force_thresholds = {
+            'P':  float(p.thresh_P  if p.thresh_P  is not None else 5.0),
+            'M3': float(p.thresh_M3 if p.thresh_M3 is not None else 20.0),
+            'M2': float(p.thresh_M2 if p.thresh_M2 is not None else 10.0),
+            'V2': float(p.thresh_V2 if p.thresh_V2 is not None else 5.0),
+            'V3': float(p.thresh_V3 if p.thresh_V3 is not None else 0.0),
+        }
         hide_decreases     = p.hide_decreases if p.hide_decreases is not None else True
         show_added_removed = p.show_added_removed if p.show_added_removed is not None else True
         display_filter     = p.display_filter or 'Failures Only'
@@ -1322,15 +1348,20 @@ class Controller(vkt.Controller):
             if status in ('ADDED', 'REMOVED') and not show_added_removed:
                 continue
 
-            # Absolute threshold — skip if all governing forces are negligible
+            # Per-force absolute thresholds — skip if every governing force is below its limit
             if status not in ('ADDED', 'REMOVED'):
-                max_force = 0.0
+                any_above = False
                 for f in gov_forces:
-                    for key in (f'{f}_Exist', f'{f}_New'):
-                        v = r.get(key)
-                        if isinstance(v, (int, float)):
-                            max_force = max(max_force, abs(v))
-                if max_force < abs_threshold:
+                    limit = force_thresholds.get(f, 0.0)
+                    max_f = max(
+                        (abs(r.get(k)) for k in (f'{f}_Exist', f'{f}_New')
+                         if isinstance(r.get(k), (int, float))),
+                        default=0.0,
+                    )
+                    if max_f >= limit:
+                        any_above = True
+                        break
+                if not any_above:
                     continue
 
             # Demand direction filter
