@@ -1348,21 +1348,36 @@ class Controller(vkt.Controller):
             if status in ('ADDED', 'REMOVED') and not show_added_removed:
                 continue
 
-            # Per-force absolute thresholds — skip if every governing force is below its limit
+            # Per-force absolute thresholds.
+            # For FLAG/WARN: at least one *increasing* governing force must be above its limit.
+            # For PASS: at least one governing force (either model) must be above its limit.
             if status not in ('ADDED', 'REMOVED'):
-                any_above = False
-                for f in gov_forces:
-                    limit = force_thresholds.get(f, 0.0)
-                    max_f = max(
-                        (abs(r.get(k)) for k in (f'{f}_Exist', f'{f}_New')
-                         if isinstance(r.get(k), (int, float))),
-                        default=0.0,
+                if status in ('FLAG', 'WARN'):
+                    any_meaningful = False
+                    for f in gov_forces:
+                        pct = r.get(f'{f}_Pct')
+                        if pct != 'INF' and not (isinstance(pct, float) and pct > 0):
+                            continue  # force not increasing — skip
+                        limit = force_thresholds.get(f, 0.0)
+                        max_f = max(
+                            (abs(r.get(k)) for k in (f'{f}_Exist', f'{f}_New')
+                             if isinstance(r.get(k), (int, float))),
+                            default=0.0,
+                        )
+                        if max_f >= limit:
+                            any_meaningful = True
+                            break
+                    if not any_meaningful:
+                        continue
+                else:  # PASS
+                    any_above = any(
+                        max((abs(r.get(k)) for k in (f'{f}_Exist', f'{f}_New')
+                             if isinstance(r.get(k), (int, float))), default=0.0)
+                        >= force_thresholds.get(f, 0.0)
+                        for f in gov_forces
                     )
-                    if max_f >= limit:
-                        any_above = True
-                        break
-                if not any_above:
-                    continue
+                    if not any_above:
+                        continue
 
             # Demand direction filter
             if hide_decreases and status not in ('ADDED', 'REMOVED'):
