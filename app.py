@@ -43,7 +43,7 @@ DETAIL_HEADERS = [
     'Net Demand', 'Fail Reason', 'Result',
 ]
 
-SUMMARY_HEADERS = ['Story', 'Type', 'Total', 'PASS', 'WARN', 'FAIL', 'ADDED', 'REMOVED']
+SUMMARY_HEADERS = ['Story', 'Type', 'Total', 'PASS', 'WARN', 'FLAG', 'ADDED', 'REMOVED']
 
 ANALYSIS_OVERVIEW_HEADERS = [
     'Story', 'Label', 'Type',
@@ -66,18 +66,26 @@ ANALYSIS_DETAIL_HEADERS = [
 
 _RESULT_COLORS = {
     'PASS':    vkt.Color(34, 139, 34),
-    'FAIL':    vkt.Color(178, 34, 34),
+    'FLAG':    vkt.Color(178, 34, 34),
     'WARN':    vkt.Color(180, 130, 0),
     'ADDED':   vkt.Color(30, 100, 200),
     'REMOVED': vkt.Color(180, 100, 0),
 }
 
 _CHART_COLORS = {
-    'FAIL':    '#B22222',
+    'FLAG':    '#B22222',
     'WARN':    '#B48200',
     'PASS':    '#228B22',
     'ADDED':   '#1E64C8',
     'REMOVED': '#B46400',
+}
+
+# Member type helpers for typed tabs
+_TYPE_SINGULAR = {'Columns': 'Column', 'Beams': 'Beam', 'Braces': 'Brace'}
+_GOVERNING_FORCES_BY_TYPE = {
+    'Columns': ['P', 'M3', 'M2'],
+    'Beams':   ['M3', 'V2'],
+    'Braces':  ['P'],
 }
 
 
@@ -130,11 +138,11 @@ def _net_demand(r: dict) -> str:
     return 'MIXED'
 
 
-_CAPACITY_WARN_THRESHOLD = 0.95  # PMM below this + FAIL → WARN (member still under capacity)
+_CAPACITY_WARN_THRESHOLD = 0.95  # PMM below this + FLAG → WARN (member still under capacity)
 
 
 def _postprocess_results(results: list) -> list:
-    """Add NetDemand; downgrade FAIL → WARN for two conditions:
+    """Add NetDemand; downgrade FLAG → WARN for two conditions:
     1. All numeric forces decreased (INF-only failure on previously-zero component).
     2. Threshold exceeded but modified PMM D/C ratio is still < 0.95 (below capacity).
     """
@@ -143,7 +151,7 @@ def _postprocess_results(results: list) -> list:
         r = dict(r)
         nd = _net_demand(r)
         r['NetDemand'] = nd
-        if r.get('Pass') == 'FAIL':
+        if r.get('Pass') == 'FLAG':
             pmm_new = r.get('PMM_New')
             forces_down = nd == 'DOWN'
             below_capacity = isinstance(pmm_new, float) and pmm_new < _CAPACITY_WARN_THRESHOLD
@@ -230,6 +238,9 @@ near-instant.
     )
 
     step2 = vkt.Step('Configure & Compare', views=[
+        'braces_table',
+        'columns_table',
+        'beams_table',
         'results_table',
         'results_detail',
         'results_chart',
@@ -265,32 +276,29 @@ For each matched member the tool finds the **worst-case force across all ETABS d
 
 **Worst Force %** - The largest percent increase among P, V2, V3, T, M2, M3 for that member.
 
-**Fail Reason** - Plain-English description of what caused the FAIL flag, e.g. "M3 +23.5% > 5% gravity".
+**Flag Reason** - Plain-English description of what tripped the FLAG threshold, e.g. "M3 +23.5% > 5% gravity". FLAG does not imply a design failure — use engineering judgment.
 """)
 
     step2.section_about.intro_thresholds = vkt.Text("""
-### Pass / Fail and Load Classification (IBC 3403)
+### Status and Load Classification (IBC 3403)
 
-A member is flagged **FAIL** if any force component or D/C ratio increases by more than the threshold for its governing load type:
+A member is **FLAG**ged if any governing force or D/C ratio increases by more than the threshold for its load type:
 
-- **Gravity combos** (dead, live, snow, roof live) - default 5% increase triggers a flag
-- **Lateral combos** (wind, seismic) - default 10% increase triggers a flag
+- **Gravity combos** (dead, live, snow, roof live) — default 5% increase triggers a flag
+- **Lateral combos** (wind, seismic) — default 10% increase triggers a flag
 
-Load type is determined from the governing combo name in the **modified** model. Combos with wind tokens (WA, WB, WG) or seismic tokens (EQ, EQB) in the name are classified as lateral; all others are gravity. Thresholds can be adjusted in the Comparison Options below.
+Load type is determined from the governing combo name in the modified model. Combos with wind tokens (WA, WB, WG) or seismic tokens (EQ, EQB) are lateral; all others are gravity. Thresholds can be adjusted in Comparison Options below.
 
-**ADDED** means the member exists in the modified model but not the existing model. No threshold check is applied.
+**FLAG** — increase exceeded the threshold. Does not imply a design failure; use engineering judgment.
 
-**REMOVED** means the member exists in the existing model but not the modified model.
+**WARN** — increase exceeded the threshold, but demand decreased overall or the member is well below capacity.
 
-Start with the **Overview** tab to spot failures quickly. Use **Full Detail** to see all six force components. The **Results Chart** shows the breakdown by story at a glance.
+**ADDED / REMOVED** — member exists only in one model; no threshold check applied.
+
+Start with the **Braces**, **Columns**, or **Beams** tab for focused review. Each shows only the relevant forces for that member class and filters out demand decreases and low-magnitude noise. Use **Overview** or **Full Detail** for the full unfiltered picture.
 """)
 
     step2.section_options = vkt.Section('Comparison Options')
-    step2.section_options.member_type = vkt.OptionField(
-        'Member Type',
-        options=['All', 'Columns', 'Beams', 'Braces'],
-        default='All',
-    )
     step2.section_options.gravity_threshold = vkt.NumberField(
         'Gravity Load Threshold — Design mode (%)',
         default=5,
@@ -310,10 +318,28 @@ Start with the **Overview** tab to spot failures quickly. Use **Full Detail** to
         description='Force increase above this triggers WARN',
     )
     step2.section_options.fail_threshold = vkt.NumberField(
-        'Fail Threshold — Analysis mode (%)',
+        'Flag Threshold — Analysis mode (%)',
         default=10,
         min=0,
-        description='Force increase above this triggers FAIL',
+        description='Force increase above this triggers FLAG',
+    )
+    step2.section_options.abs_threshold = vkt.NumberField(
+        'Absolute Force Threshold (kips / kip-ft)',
+        default=5.0,
+        min=0,
+        description=(
+            'Members whose governing forces are all below this magnitude are excluded '
+            'from the typed tabs regardless of % change. Eliminates sign-reversal noise '
+            'on low-demand members.'
+        ),
+    )
+    step2.section_options.hide_decreases = vkt.BooleanField(
+        'Hide members where demand decreased',
+        default=True,
+        description=(
+            'When checked, members where all governing forces decreased are excluded '
+            'from the Braces / Columns / Beams tabs. ADDED and REMOVED rows are always shown.'
+        ),
     )
     step2.section_options.display_filter = vkt.OptionField(
         'Display Filter',
@@ -322,8 +348,14 @@ Start with the **Overview** tab to spot failures quickly. Use **Full Detail** to
     )
 
     step2.section_export = vkt.Section('Export')
+    step2.section_export.member_type_export = vkt.OptionField(
+        'Export Member Type',
+        options=['All', 'Columns', 'Beams', 'Braces'],
+        default='All',
+        description='Filter CSV export to one member class for manual strike-through review',
+    )
     step2.section_export.download_btn = vkt.DownloadButton(
-        'Export Full Results to CSV',
+        'Export Results to CSV',
         method='download_csv',
         longpoll=True,
     )
@@ -436,13 +468,13 @@ def _render_beam_detail_html(beam: Optional[dict], gravity_thresh: float, latera
     fail_rsn  = beam.get('FailReason', '')
     sign_rev  = beam.get('SignReversal', '')
 
-    banner_bg = '#B22222' if pass_val == 'FAIL' else '#228B22'
+    banner_bg = '#B22222' if pass_val == 'FLAG' else '#228B22'
 
-    if pass_val == 'FAIL':
-        result_phrase = '<span style="font-weight:bold">FAILED</span>'
+    if pass_val == 'FLAG':
+        result_phrase = '<span style="font-weight:bold">FLAGGED</span>'
         narrative = (
             f'Beam <strong>{label}</strong> on Story <strong>{story}</strong> {result_phrase} — '
-            f'{fail_rsn}.'
+            f'{fail_rsn}. Review required; FLAG does not imply a design failure.'
         )
     else:
         result_phrase = '<span style="font-weight:bold">PASSED</span>'
@@ -476,7 +508,7 @@ def _render_beam_detail_html(beam: Optional[dict], gravity_thresh: float, latera
     def _force_row(name: str, exist_val, new_val, pct_val, thresh: float) -> str:
         is_fail = (pct_val == 'INF') or (isinstance(pct_val, float) and pct_val > thresh)
         row_bg  = '#fff0f0' if is_fail else 'transparent'
-        status  = 'FAIL' if is_fail else 'PASS'
+        status  = 'FLAG' if is_fail else 'PASS'
         sc      = '#B22222' if is_fail else '#228B22'
         return (
             f'<tr style="background:{row_bg}">'
@@ -500,7 +532,7 @@ def _render_beam_detail_html(beam: Optional[dict], gravity_thresh: float, latera
     def _dc_row(name: str, combo_exist: str, combo_new: str, exist_val, new_val, pct_val, thresh: float) -> str:
         is_fail = (pct_val == 'INF') or (isinstance(pct_val, float) and pct_val > thresh)
         row_bg  = '#fff0f0' if is_fail else 'transparent'
-        status  = 'FAIL' if is_fail else 'PASS'
+        status  = 'FLAG' if is_fail else 'PASS'
         sc      = '#B22222' if is_fail else '#228B22'
         ce = combo_exist if combo_exist and combo_exist != 'N/A' else '—'
         cn = combo_new   if combo_new   and combo_new   != 'N/A' else '—'
@@ -744,7 +776,7 @@ class Controller(vkt.Controller):
             horizontal_spacing=0.04,
         )
 
-        status_order = ['FAIL', 'PASS', 'ADDED', 'REMOVED']
+        status_order = ['FLAG', 'WARN', 'PASS', 'ADDED', 'REMOVED']
         for col_idx, mtype in enumerate(member_types, start=1):
             sub = grouped[grouped['MemberType'] == mtype]
             for status in status_order:
@@ -791,7 +823,7 @@ class Controller(vkt.Controller):
 
         data = []
         for s in summary:
-            fail_count = s['FAIL']
+            fail_count = s['FLAG']
             warn_count = s['WARN']
             fail_cell = vkt.TableCell(
                 str(fail_count),
@@ -830,7 +862,7 @@ class Controller(vkt.Controller):
 
         from collections import Counter
         total    = len(all_results)
-        failures = [r for r in all_results if r.get('Pass') == 'FAIL']
+        failures = [r for r in all_results if r.get('Pass') == 'FLAG']
         warnings = [r for r in all_results if r.get('Pass') == 'WARN']
         added    = [r for r in all_results if r.get('Pass') == 'ADDED']
         removed  = [r for r in all_results if r.get('Pass') == 'REMOVED']
@@ -843,7 +875,7 @@ class Controller(vkt.Controller):
             story_fail_counts.most_common(1)[0] if story_fail_counts else ('None', 0)
         )
 
-        fail_status = vkt.DataStatus.ERROR if n_fail > 0 else vkt.DataStatus.SUCCESS
+        fail_status = vkt.DataStatus.WARNING if n_fail > 0 else vkt.DataStatus.SUCCESS
         rate_status = (
             vkt.DataStatus.ERROR   if fail_rate > 10 else
             vkt.DataStatus.WARNING if fail_rate > 0  else
@@ -867,8 +899,8 @@ class Controller(vkt.Controller):
             )
             data = vkt.DataGroup(
                 vkt.DataItem('Total Members Compared', total),
-                vkt.DataItem('Failures', n_fail, status=fail_status,
-                             status_message='Members exceeding fail threshold' if n_fail > 0 else 'All members within threshold'),
+                vkt.DataItem('Flagged', n_fail, status=fail_status,
+                             status_message='Members exceeding flag threshold — review required' if n_fail > 0 else 'All members within threshold'),
                 vkt.DataItem('Failure Rate', fail_rate, suffix='%', number_of_decimals=1, status=rate_status),
                 vkt.DataItem('Warnings', n_warn,
                              status=vkt.DataStatus.WARNING if n_warn > 0 else vkt.DataStatus.SUCCESS),
@@ -894,8 +926,8 @@ class Controller(vkt.Controller):
             )
             data = vkt.DataGroup(
                 vkt.DataItem('Total Members Compared', total),
-                vkt.DataItem('Failures', n_fail, status=fail_status,
-                             status_message='Members exceeding IBC 3403 thresholds' if n_fail > 0 else 'All members within threshold'),
+                vkt.DataItem('Flagged', n_fail, status=fail_status,
+                             status_message='Members exceeding IBC 3403 thresholds — use judgment' if n_fail > 0 else 'All members within threshold'),
                 vkt.DataItem('Failure Rate', fail_rate, suffix='%', number_of_decimals=1, status=rate_status),
                 vkt.DataItem('Warnings', n_warn,
                              status=vkt.DataStatus.WARNING if n_warn > 0 else vkt.DataStatus.SUCCESS,
@@ -933,10 +965,183 @@ class Controller(vkt.Controller):
         html    = _render_beam_detail_html(beam, gravity_thresh, lateral_thresh)
         return vkt.WebResult(html=html)
 
+    # -- Typed member-class tabs -----------------------------------------------
+
+    @vkt.TableView('Braces', duration_guess=2)
+    def braces_table(self, params, **kwargs):
+        if not params.step1.existing_file or not params.step1.modified_file:
+            raise vkt.UserError('Please upload both model files in Step 1.')
+        mode    = params.step1.mode or 'Design Results'
+        results = self._run_typed(params, 'Braces')
+        if not results:
+            raise vkt.UserError(
+                'No braces flagged for review. All may be passing, below the absolute force '
+                'threshold, or demand decreased for all. Switch to "All Results" or lower '
+                'the absolute threshold to see the full brace list.'
+            )
+        if mode == 'Analysis Results':
+            headers = [
+                'Story', 'Label', 'Combo (Exist)', 'Combo (New)',
+                'P (Exist)', 'P (New)', 'P (%)',
+                'Worst (%)', 'Flag Reason', 'Result',
+            ]
+            data = []
+            for r in results:
+                data.append([
+                    r.get('Story', ''), r.get('Label', ''),
+                    r.get('GovCombo_Exist', ''), r.get('GovCombo_New', ''),
+                    r.get('P_Exist', ''), r.get('P_New', ''),
+                    _fmt_pct(r.get('P_Pct', '')),
+                    _fmt_pct(r.get('WorstPct', '')),
+                    r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
+                ])
+        else:
+            headers = [
+                'Story', 'Label', 'Section (Exist)', 'Section (New)',
+                'Combo (Exist)', 'Combo (New)', 'Load Type',
+                'P (Exist)', 'P (New)', 'P (%)',
+                'PMM (Exist)', 'PMM (New)', 'PMM (%)',
+                'Flag Reason', 'Result',
+            ]
+            data = []
+            for r in results:
+                data.append([
+                    r.get('Story', ''), r.get('Label', ''),
+                    r.get('DesignSection_Exist', ''), r.get('DesignSection_New', ''),
+                    r.get('GovCombo_Exist', ''), r.get('GovCombo_New', ''),
+                    r.get('LoadType', ''),
+                    r.get('P_Exist', ''), r.get('P_New', ''),
+                    _fmt_pct(r.get('P_Pct', '')),
+                    r.get('PMM_Exist', ''), r.get('PMM_New', ''),
+                    _fmt_pct(r.get('PMM_Pct', '')),
+                    r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
+                ])
+        return vkt.TableResult(data, column_headers=headers)
+
+    @vkt.TableView('Columns', duration_guess=2)
+    def columns_table(self, params, **kwargs):
+        if not params.step1.existing_file or not params.step1.modified_file:
+            raise vkt.UserError('Please upload both model files in Step 1.')
+        mode    = params.step1.mode or 'Design Results'
+        results = self._run_typed(params, 'Columns')
+        if not results:
+            raise vkt.UserError(
+                'No columns flagged for review. All may be passing, below the absolute force '
+                'threshold, or demand decreased for all. Switch to "All Results" or lower '
+                'the absolute threshold to see the full column list.'
+            )
+        if mode == 'Analysis Results':
+            headers = [
+                'Story', 'Label', 'Combo (Exist)', 'Combo (New)',
+                'P (Exist)', 'P (New)', 'P (%)',
+                'M3 (Exist)', 'M3 (New)', 'M3 (%)',
+                'M2 (Exist)', 'M2 (New)', 'M2 (%)',
+                'Worst (%)', 'Flag Reason', 'Result',
+            ]
+            data = []
+            for r in results:
+                data.append([
+                    r.get('Story', ''), r.get('Label', ''),
+                    r.get('GovCombo_Exist', ''), r.get('GovCombo_New', ''),
+                    r.get('P_Exist', ''), r.get('P_New', ''),
+                    _fmt_pct(r.get('P_Pct', '')),
+                    r.get('M3_Exist', ''), r.get('M3_New', ''),
+                    _fmt_pct(r.get('M3_Pct', '')),
+                    r.get('M2_Exist', ''), r.get('M2_New', ''),
+                    _fmt_pct(r.get('M2_Pct', '')),
+                    _fmt_pct(r.get('WorstPct', '')),
+                    r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
+                ])
+        else:
+            headers = [
+                'Story', 'Label', 'Section (Exist)', 'Section (New)',
+                'Combo (Exist)', 'Combo (New)', 'Load Type',
+                'P (Exist)', 'P (New)', 'P (%)',
+                'M3 (Exist)', 'M3 (New)', 'M3 (%)',
+                'M2 (Exist)', 'M2 (New)', 'M2 (%)',
+                'PMM (Exist)', 'PMM (New)', 'PMM (%)',
+                'Flag Reason', 'Result',
+            ]
+            data = []
+            for r in results:
+                data.append([
+                    r.get('Story', ''), r.get('Label', ''),
+                    r.get('DesignSection_Exist', ''), r.get('DesignSection_New', ''),
+                    r.get('GovCombo_Exist', ''), r.get('GovCombo_New', ''),
+                    r.get('LoadType', ''),
+                    r.get('P_Exist', ''), r.get('P_New', ''),
+                    _fmt_pct(r.get('P_Pct', '')),
+                    r.get('M3_Exist', ''), r.get('M3_New', ''),
+                    _fmt_pct(r.get('M3_Pct', '')),
+                    r.get('M2_Exist', ''), r.get('M2_New', ''),
+                    _fmt_pct(r.get('M2_Pct', '')),
+                    r.get('PMM_Exist', ''), r.get('PMM_New', ''),
+                    _fmt_pct(r.get('PMM_Pct', '')),
+                    r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
+                ])
+        return vkt.TableResult(data, column_headers=headers)
+
+    @vkt.TableView('Beams', duration_guess=2)
+    def beams_table(self, params, **kwargs):
+        if not params.step1.existing_file or not params.step1.modified_file:
+            raise vkt.UserError('Please upload both model files in Step 1.')
+        mode    = params.step1.mode or 'Design Results'
+        results = self._run_typed(params, 'Beams')
+        if not results:
+            raise vkt.UserError(
+                'No beams flagged for review. All may be passing, below the absolute force '
+                'threshold, or demand decreased for all. Switch to "All Results" or lower '
+                'the absolute threshold to see the full beam list.'
+            )
+        if mode == 'Analysis Results':
+            headers = [
+                'Story', 'Label', 'Combo (Exist)', 'Combo (New)',
+                'M3 (Exist)', 'M3 (New)', 'M3 (%)',
+                'V2 (Exist)', 'V2 (New)', 'V2 (%)',
+                'Worst (%)', 'Flag Reason', 'Result',
+            ]
+            data = []
+            for r in results:
+                data.append([
+                    r.get('Story', ''), r.get('Label', ''),
+                    r.get('GovCombo_Exist', ''), r.get('GovCombo_New', ''),
+                    r.get('M3_Exist', ''), r.get('M3_New', ''),
+                    _fmt_pct(r.get('M3_Pct', '')),
+                    r.get('V2_Exist', ''), r.get('V2_New', ''),
+                    _fmt_pct(r.get('V2_Pct', '')),
+                    _fmt_pct(r.get('WorstPct', '')),
+                    r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
+                ])
+        else:
+            headers = [
+                'Story', 'Label', 'Section (Exist)', 'Section (New)',
+                'Combo (Exist)', 'Combo (New)', 'Load Type',
+                'M3 (Exist)', 'M3 (New)', 'M3 (%)',
+                'V2 (Exist)', 'V2 (New)', 'V2 (%)',
+                'PMM (Exist)', 'PMM (New)', 'PMM (%)',
+                'Flag Reason', 'Result',
+            ]
+            data = []
+            for r in results:
+                data.append([
+                    r.get('Story', ''), r.get('Label', ''),
+                    r.get('DesignSection_Exist', ''), r.get('DesignSection_New', ''),
+                    r.get('GovCombo_Exist', ''), r.get('GovCombo_New', ''),
+                    r.get('LoadType', ''),
+                    r.get('M3_Exist', ''), r.get('M3_New', ''),
+                    _fmt_pct(r.get('M3_Pct', '')),
+                    r.get('V2_Exist', ''), r.get('V2_New', ''),
+                    _fmt_pct(r.get('V2_Pct', '')),
+                    r.get('PMM_Exist', ''), r.get('PMM_New', ''),
+                    _fmt_pct(r.get('PMM_Pct', '')),
+                    r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
+                ])
+        return vkt.TableResult(data, column_headers=headers)
+
     def _find_worst_beam(self, results: list) -> Optional[dict]:
         beams = [r for r in results if r.get('MemberType') == 'Beam'
                  and r.get('Pass') not in ('ADDED', 'REMOVED')]
-        fails = [r for r in beams if r.get('Pass') == 'FAIL']
+        fails = [r for r in beams if r.get('Pass') == 'FLAG']
         pool  = fails if fails else beams
         if not pool:
             return None
@@ -957,7 +1162,12 @@ class Controller(vkt.Controller):
             raise vkt.UserError('Please upload both model files in Step 1.')
         mode = params.step1.mode or 'Design Results'
         results = self._run_analysis_all(params) if mode == 'Analysis Results' else self._run_all(params)
-        return vkt.DownloadResult(results_to_csv(results), 'etabs_comparison_results.csv')
+        export_type = params.step2.section_export.member_type_export or 'All'
+        if export_type != 'All':
+            singular = _TYPE_SINGULAR[export_type]
+            results = [r for r in results if r.get('MemberType') == singular]
+        suffix = f'_{export_type.lower()}' if export_type != 'All' else ''
+        return vkt.DownloadResult(results_to_csv(results), f'etabs_comparison{suffix}.csv')
 
     # -- LLM chat ------------------------------------------------------------
 
@@ -971,7 +1181,7 @@ class Controller(vkt.Controller):
         gravity_thresh  = float(p.gravity_threshold or 5)
         lateral_thresh  = float(p.lateral_threshold or 10)
         all_results     = self._run_all(params)
-        failures        = [r for r in all_results if r.get('Pass') in ('FAIL', 'WARN')]
+        failures        = [r for r in all_results if r.get('Pass') in ('FLAG', 'WARN')]
 
         failure_lines = []
         for r in failures[:60]:
@@ -980,7 +1190,7 @@ class Controller(vkt.Controller):
                 if r.get('DesignSection_Exist') != r.get('DesignSection_New')
                 else r.get('DesignSection_Exist', 'N/A')
             )
-            status = r.get('Pass', 'FAIL')
+            status = r.get('Pass', 'FLAG')
             failure_lines.append(
                 f"- [{status}] {r['MemberType']} {r['Label']} (Story {r['Story']}): "
                 f"{r.get('FailReason', 'N/A')} | net demand: {r.get('NetDemand', 'N/A')} | "
@@ -1031,7 +1241,7 @@ class Controller(vkt.Controller):
         results = run_comparison(
             existing_file=params.step1.existing_file.file,
             modified_file=params.step1.modified_file.file,
-            member_type_filter=p.member_type or 'All',
+            member_type_filter='All',
             gravity_threshold=float(p.gravity_threshold or 5),
             lateral_threshold=float(p.lateral_threshold or 10),
             show_failures_only=(p.display_filter == 'Failures Only'),
@@ -1039,12 +1249,12 @@ class Controller(vkt.Controller):
         return _postprocess_results(results)
 
     def _run_all(self, params):
-        """Unfiltered results — used by chart, summary, key metrics, and CSV."""
+        """Unfiltered results — used by chart, summary, key metrics, CSV, and typed tabs."""
         p = params.step2.section_options
         results = run_comparison(
             existing_file=params.step1.existing_file.file,
             modified_file=params.step1.modified_file.file,
-            member_type_filter=p.member_type or 'All',
+            member_type_filter='All',
             gravity_threshold=float(p.gravity_threshold or 5),
             lateral_threshold=float(p.lateral_threshold or 10),
             show_failures_only=False,
@@ -1057,20 +1267,73 @@ class Controller(vkt.Controller):
         return run_analysis_comparison(
             existing_file=params.step1.existing_file.file,
             modified_file=params.step1.modified_file.file,
-            member_type_filter=p.member_type or 'All',
+            member_type_filter='All',
             warn_threshold=float(p.warn_threshold or 5),
             fail_threshold=float(p.fail_threshold or 10),
             show_failures_only=(p.display_filter == 'Failures Only'),
         )
 
     def _run_analysis_all(self, params):
-        """Unfiltered analysis results — used by chart, summary, key metrics, and CSV."""
+        """Unfiltered analysis results — used by chart, summary, key metrics, CSV, and typed tabs."""
         p = params.step2.section_options
         return run_analysis_comparison(
             existing_file=params.step1.existing_file.file,
             modified_file=params.step1.modified_file.file,
-            member_type_filter=p.member_type or 'All',
+            member_type_filter='All',
             warn_threshold=float(p.warn_threshold or 5),
             fail_threshold=float(p.fail_threshold or 10),
             show_failures_only=False,
         )
+
+    def _run_typed(self, params, member_type: str) -> list:
+        """Filtered + focused results for one member type (typed review tabs).
+
+        Applies: member type filter, absolute force threshold, demand direction
+        filter, and display_filter (Failures Only / All Results).
+        """
+        p = params.step2.section_options
+        mode = params.step1.mode or 'Design Results'
+        abs_threshold  = float(p.abs_threshold if p.abs_threshold is not None else 5.0)
+        hide_decreases = p.hide_decreases if p.hide_decreases is not None else True
+        display_filter = p.display_filter or 'Failures Only'
+
+        all_results = (
+            self._run_analysis_all(params)
+            if mode == 'Analysis Results'
+            else self._run_all(params)
+        )
+
+        singular   = _TYPE_SINGULAR[member_type]
+        gov_forces = _GOVERNING_FORCES_BY_TYPE[member_type]
+
+        out = []
+        for r in all_results:
+            if r.get('MemberType') != singular:
+                continue
+
+            status = r.get('Pass', '')
+
+            # Absolute threshold — skip if all governing forces are negligible
+            if status not in ('ADDED', 'REMOVED'):
+                max_force = 0.0
+                for f in gov_forces:
+                    for key in (f'{f}_Exist', f'{f}_New'):
+                        v = r.get(key)
+                        if isinstance(v, (int, float)):
+                            max_force = max(max_force, abs(v))
+                if max_force < abs_threshold:
+                    continue
+
+            # Demand direction filter
+            if hide_decreases and status not in ('ADDED', 'REMOVED'):
+                nd = r.get('NetDemand') or _net_demand(r)
+                if nd == 'DOWN':
+                    continue
+
+            # Display filter
+            if display_filter == 'Failures Only' and status == 'PASS':
+                continue
+
+            out.append(r)
+
+        return out

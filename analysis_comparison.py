@@ -44,7 +44,8 @@ GOVERNING_FORCES = {
     'Braces':  ['P'],
 }
 
-# Caching handled by storage_cache. Prefixes: 'etabs_aparse' / 'etabs_acmp'.
+# Caching handled by storage_cache. Prefixes: 'etabs_aparsev2' / 'etabs_acmpv2'.
+# v2: adds OutputCase tracking (governing combo) to parsed DataFrames.
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +59,8 @@ def _parse_analysis_forces_from_wb(wb, member_type: str) -> pd.DataFrame:
     """
     sheet_name     = ANALYSIS_FORCES_SHEETS[member_type]
     label_col_name = ANALYSIS_LABEL_COL[member_type]
-    empty = pd.DataFrame(columns=['Story', 'Label'] + ALL_FORCE_COMPONENTS)
+    combo_cols = [f'{c}_Combo' for c in ALL_FORCE_COMPONENTS]
+    empty = pd.DataFrame(columns=['Story', 'Label'] + ALL_FORCE_COMPONENTS + combo_cols)
 
     if sheet_name not in wb.sheetnames:
         return empty
@@ -68,8 +70,9 @@ def _parse_analysis_forces_from_wb(wb, member_type: str) -> pd.DataFrame:
     except StopIteration:
         return empty
 
-    story_i = col_map.get('Story')
-    label_i = col_map.get(label_col_name)
+    story_i      = col_map.get('Story')
+    label_i      = col_map.get(label_col_name)
+    output_case_i = col_map.get('OutputCase')
     if story_i is None or label_i is None:
         return empty
 
@@ -83,15 +86,22 @@ def _parse_analysis_forces_from_wb(wb, member_type: str) -> pd.DataFrame:
         label = vals[label_i] if label_i < n else None
         if story is None or label is None:
             continue
+        output_case = (
+            str(vals[output_case_i])
+            if output_case_i is not None and output_case_i < n and vals[output_case_i] is not None
+            else ''
+        )
         key = (story, label)
         if key not in accum:
-            accum[key] = dict.fromkeys(ALL_FORCE_COMPONENTS, 0.0)
+            accum[key] = {c: 0.0 for c in ALL_FORCE_COMPONENTS}
+            accum[key].update({f'{c}_Combo': '' for c in ALL_FORCE_COMPONENTS})
         for c, ci in force_col_indices.items():
             if ci is not None and ci < n and vals[ci] is not None:
                 try:
                     v = float(vals[ci])
                     if abs(v) > abs(accum[key][c]):
                         accum[key][c] = v
+                        accum[key][f'{c}_Combo'] = output_case
                 except (TypeError, ValueError):
                     pass
 
@@ -107,7 +117,7 @@ def _get_parsed_analysis_file(file_obj) -> tuple:
     file_bytes = file_obj.getvalue_binary()
     h = hashlib.md5(file_bytes).hexdigest()
 
-    cached = get_cached('etabs_aparse', h)
+    cached = get_cached('etabs_aparsev2', h)
     if cached is not None:
         return h, cached
 
@@ -134,7 +144,7 @@ def _get_parsed_analysis_file(file_obj) -> tuple:
             'sheet_names': [],
         }
 
-    set_cached('etabs_aparse', h, result)
+    set_cached('etabs_aparsev2', h, result)
     return h, result
 
 
@@ -183,6 +193,21 @@ def _run_analysis_internal(
         fe_lookup = _build_lookup(forces_exist)
         fn_lookup = _build_lookup(forces_new)
 
+        def _gov_combo(series, forces: list) -> str:
+            """Return the OutputCase that drove the max absolute governing force."""
+            if series is None:
+                return ''
+            best_val, best_combo = 0.0, ''
+            for c in forces:
+                try:
+                    v = abs(float(series[c]))
+                    if v > best_val:
+                        best_val = v
+                        best_combo = str(series.get(f'{c}_Combo', '') or '')
+                except (TypeError, ValueError, KeyError):
+                    pass
+            return best_combo or 'N/A'
+
         for story, label in sorted(all_members, key=lambda x: (str(x[0]), str(x[1]))):
             in_exist = (story, label) in exist_members
             in_new   = (story, label) in new_members
@@ -204,14 +229,22 @@ def _run_analysis_internal(
             if not in_new:
                 for c in gov_forces:
                     row[f'{c}_Exist'] = _fmt(float(ef[c]), 2) if ef is not None else 'N/A'
-                row.update({'WorstPct': 'N/A', 'FailReason': '', 'Pass': 'REMOVED'})
+                row.update({
+                    'GovCombo_Exist': _gov_combo(ef, gov_forces),
+                    'GovCombo_New':   'N/A',
+                    'WorstPct': 'N/A', 'FailReason': '', 'Pass': 'REMOVED',
+                })
                 all_results.append(row)
                 continue
 
             if not in_exist:
                 for c in gov_forces:
                     row[f'{c}_New'] = _fmt(float(nf[c]), 2) if nf is not None else 'N/A'
-                row.update({'WorstPct': 'N/A', 'FailReason': '', 'Pass': 'ADDED'})
+                row.update({
+                    'GovCombo_Exist': 'N/A',
+                    'GovCombo_New':   _gov_combo(nf, gov_forces),
+                    'WorstPct': 'N/A', 'FailReason': '', 'Pass': 'ADDED',
+                })
                 all_results.append(row)
                 continue
 
@@ -235,13 +268,15 @@ def _run_analysis_internal(
                 else:
                     row[f'{c}_Pct'] = 'N/A'
 
+            row['GovCombo_Exist'] = _gov_combo(ef, gov_forces)
+            row['GovCombo_New']   = _gov_combo(nf, gov_forces)
             row['WorstPct'] = round(worst_pct, 1) if worst_pct is not None else 'N/A'
 
             if worst_pct is not None and worst_pct > fail_threshold:
                 pct_val = row[f'{worst_force}_Pct']
                 pct_str = f'+{pct_val:.1f}%' if isinstance(pct_val, float) else 'INF'
                 row['FailReason'] = f'{worst_force} {pct_str} > {fail_threshold:.0f}%'
-                row['Pass'] = 'FAIL'
+                row['Pass'] = 'FLAG'
             elif worst_pct is not None and worst_pct > warn_threshold:
                 pct_val = row[f'{worst_force}_Pct']
                 pct_str = f'+{pct_val:.1f}%' if isinstance(pct_val, float) else str(pct_val)
@@ -279,14 +314,14 @@ def run_analysis_comparison(
     new_hash,   parsed_new   = _get_parsed_analysis_file(modified_file)
     cache_key = (exist_hash, new_hash, member_type_filter, warn_threshold, fail_threshold)
 
-    all_results = get_cached('etabs_acmp', cache_key)
+    all_results = get_cached('etabs_acmpv2', cache_key)
     if all_results is None:
         all_results = _run_analysis_internal(
             parsed_exist, parsed_new,
             member_type_filter, warn_threshold, fail_threshold,
         )
-        set_cached('etabs_acmp', cache_key, all_results)
+        set_cached('etabs_acmpv2', cache_key, all_results)
 
     if show_failures_only:
-        return [r for r in all_results if r.get('Pass') in ('FAIL', 'WARN')]
+        return [r for r in all_results if r.get('Pass') in ('FLAG', 'WARN')]
     return list(all_results)

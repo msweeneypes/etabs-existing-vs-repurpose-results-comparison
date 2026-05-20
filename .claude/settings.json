@@ -8,7 +8,13 @@
       "Bash(venv/Scripts/python.exe -c \"import app; print\\('OK'\\)\")",
       "Read(//c/Users/msweeney/.claude/plans/**)",
       "Bash(venv/Scripts/python -c \"import python_calamine; import pandas as pd; print\\('calamine importable'\\); print\\('pandas', pd.__version__\\)\")",
-      "Bash(curl -s \"https://docs.viktor.ai/llms-full.txt\")"
+      "Bash(curl -s \"https://docs.viktor.ai/llms-full.txt\")",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\msweeney\\\\viktor-apps\\\\etabs-existing-vs-repurpose-results-comparison\" -Recurse -File -Name)",
+      "Bash(Select-Object -First 50)",
+      "Bash(dir /s /b \"c:\\\\Users\\\\msweeney\\\\viktor-apps\\\\etabs-existing-vs-repurpose-results-comparison\" *.py)",
+      "Bash(dir c:\\\\Users\\\\msweeney\\\\viktor-apps\\\\etabs-existing-vs-repurpose-results-comparison /B /S)",
+      "Bash(findstr /E \"\\\\.py$\")",
+      "Bash(findstr /V \"venv\")"
     ]
   }
 }

@@ -588,7 +588,7 @@ def _run_comparison_internal(
 
             row['SignReversal'] = 'YES' if any_sign_rev else ''
             row['FailReason']   = _compute_fail_reason(row, threshold, load_type, any_sign_rev, is_fail)
-            row['Pass']         = 'FAIL' if is_fail else 'PASS'
+            row['Pass']         = 'FLAG' if is_fail else 'PASS'
 
             all_results.append(row)
 
@@ -632,7 +632,7 @@ def run_comparison(
         set_cached('etabs_cmp', cache_key, all_results)
 
     if show_failures_only:
-        return [r for r in all_results if r.get('Pass') == 'FAIL']
+        return [r for r in all_results if r.get('Pass') == 'FLAG']
     return list(all_results)
 
 
@@ -641,13 +641,13 @@ def build_summary(results: list) -> list:
     Group results by MemberType and Story; count PASS/FAIL/ADDED/REMOVED.
     Returns list of row dicts: Story, MemberType, Total, PASS, FAIL, ADDED, REMOVED.
     """
-    counts = defaultdict(lambda: {'Total': 0, 'PASS': 0, 'WARN': 0, 'FAIL': 0, 'ADDED': 0, 'REMOVED': 0})
+    counts = defaultdict(lambda: {'Total': 0, 'PASS': 0, 'WARN': 0, 'FLAG': 0, 'ADDED': 0, 'REMOVED': 0})
 
     for r in results:
         key = (r.get('Story', ''), r.get('MemberType', ''))
         counts[key]['Total'] += 1
         status = r.get('Pass', '')
-        if status in ('PASS', 'WARN', 'FAIL', 'ADDED', 'REMOVED'):
+        if status in ('PASS', 'WARN', 'FLAG', 'ADDED', 'REMOVED'):
             counts[key][status] += 1
 
     summary = []
@@ -658,7 +658,7 @@ def build_summary(results: list) -> list:
             'Total':      c['Total'],
             'PASS':       c['PASS'],
             'WARN':       c['WARN'],
-            'FAIL':       c['FAIL'],
+            'FLAG':       c['FLAG'],
             'ADDED':      c['ADDED'],
             'REMOVED':    c['REMOVED'],
         })
