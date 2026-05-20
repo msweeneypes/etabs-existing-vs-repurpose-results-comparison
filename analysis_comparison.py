@@ -44,7 +44,7 @@ GOVERNING_FORCES = {
     'Braces':  ['P'],
 }
 
-# Caching handled by storage_cache. Prefixes: 'etabs_aparsev2' / 'etabs_acmpv2'.
+# Caching handled by storage_cache. Prefixes: 'etabs_aparsev3' / 'etabs_acmpv3'.
 # v2: adds OutputCase tracking (governing combo) to parsed DataFrames.
 
 
@@ -72,7 +72,9 @@ def _parse_analysis_forces_from_wb(wb, member_type: str) -> pd.DataFrame:
 
     story_i      = col_map.get('Story')
     label_i      = col_map.get(label_col_name)
-    output_case_i = col_map.get('OutputCase')
+    # ETABS column name varies by version: 'Output Case', 'OutputCase', 'Load Case/Combo'
+    _oc_candidates = ['Output Case', 'OutputCase', 'Load Case/Combo']
+    output_case_i = next((col_map[k] for k in _oc_candidates if k in col_map), None)
     if story_i is None or label_i is None:
         return empty
 
@@ -117,7 +119,7 @@ def _get_parsed_analysis_file(file_obj) -> tuple:
     file_bytes = file_obj.getvalue_binary()
     h = hashlib.md5(file_bytes).hexdigest()
 
-    cached = get_cached('etabs_aparsev2', h)
+    cached = get_cached('etabs_aparsev3', h)
     if cached is not None:
         return h, cached
 
@@ -144,7 +146,7 @@ def _get_parsed_analysis_file(file_obj) -> tuple:
             'sheet_names': [],
         }
 
-    set_cached('etabs_aparsev2', h, result)
+    set_cached('etabs_aparsev3', h, result)
     return h, result
 
 
@@ -314,13 +316,13 @@ def run_analysis_comparison(
     new_hash,   parsed_new   = _get_parsed_analysis_file(modified_file)
     cache_key = (exist_hash, new_hash, member_type_filter, warn_threshold, fail_threshold)
 
-    all_results = get_cached('etabs_acmpv2', cache_key)
+    all_results = get_cached('etabs_acmpv3', cache_key)
     if all_results is None:
         all_results = _run_analysis_internal(
             parsed_exist, parsed_new,
             member_type_filter, warn_threshold, fail_threshold,
         )
-        set_cached('etabs_acmpv2', cache_key, all_results)
+        set_cached('etabs_acmpv3', cache_key, all_results)
 
     if show_failures_only:
         return [r for r in all_results if r.get('Pass') in ('FLAG', 'WARN')]
