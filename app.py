@@ -304,6 +304,7 @@ near-instant.
         'results_chart',
         'summary_table',
         'beam_detail_view',
+        'member_detail_view',
     ])
 
     step2.section_about = vkt.Section('How This Works')
@@ -458,6 +459,20 @@ Start with the **Braces**, **Columns**, or **Beams** tab for focused review. Eac
         'Export Results to CSV',
         method='download_csv',
         longpoll=True,
+    )
+
+    step2.section_detail = vkt.Section('Member Detail')
+    step2.section_detail.detail_intro = vkt.Text(
+        'Enter a member label to view a full detail card for that member. '
+        'The label must match exactly as it appears in the comparison results (e.g. "C12", "B5").'
+    )
+    step2.section_detail.detail_label = vkt.TextField(
+        'Member Label',
+        description='Label to look up (e.g. "C12"). Case-insensitive.',
+    )
+    step2.section_detail.detail_story = vkt.TextField(
+        'Story (optional)',
+        description='Specify story if the label appears on multiple stories.',
     )
 
     step2.section_ai = vkt.Section('AI Assistant')
@@ -728,6 +743,217 @@ def _render_beam_detail_html(beam: Optional[dict], gravity_thresh: float, latera
 
 </body></html>"""
     return html
+
+
+# ---------------------------------------------------------------------------
+# Generic member detail HTML renderer
+# ---------------------------------------------------------------------------
+
+_BANNER_COLORS = {
+    'FLAG':    '#B22222',
+    'WARN':    '#B48200',
+    'PASS':    '#228B22',
+    'ADDED':   '#1E64C8',
+    'REMOVED': '#B46400',
+}
+
+
+def _render_member_detail_html(
+    member: Optional[dict],
+    gravity_thresh: float,
+    lateral_thresh: float,
+    mode: str,
+) -> str:
+    if member is None:
+        return (
+            '<p style="font-family:sans-serif;padding:24px;color:#555;font-size:15px;">'
+            'Enter a member label in <strong>Member Detail</strong> above to view its '
+            'detail card. The label must match exactly as shown in the results tables '
+            '(e.g. "C12", "B5"). Optionally enter a story to disambiguate.</p>'
+        )
+
+    is_analysis = (mode == 'Analysis Results')
+    load_type   = member.get('LoadType', 'gravity') if not is_analysis else None
+    threshold   = (lateral_thresh if load_type == 'lateral' else gravity_thresh) if not is_analysis else gravity_thresh
+    pass_val    = member.get('Pass', '')
+    label       = member.get('Label', '')
+    story       = member.get('Story', '')
+    mtype       = member.get('MemberType', '')
+    sect_e      = member.get('DesignSection_Exist', 'N/A') or 'N/A'
+    sect_n      = member.get('DesignSection_New',   'N/A') or 'N/A'
+    combo_e     = member.get('GovCombo_Exist', '') or 'N/A'
+    combo_n     = member.get('GovCombo_New',   '') or 'N/A'
+    fail_rsn    = member.get('FailReason', '')
+    sign_rev    = member.get('SignReversal', '')
+    net_demand  = member.get('NetDemand', '')
+    banner_bg   = _BANNER_COLORS.get(pass_val, '#888888')
+
+    # Narrative
+    if pass_val in ('FLAG', 'WARN'):
+        narrative = (
+            f'{mtype} <strong>{label}</strong>, Story <strong>{story}</strong> — '
+            f'<strong>{pass_val}</strong>. {fail_rsn}.'
+        )
+        if pass_val == 'WARN':
+            narrative += ' Threshold exceeded but demand is within acceptable range — review advised.'
+    elif pass_val == 'PASS':
+        narrative = (
+            f'{mtype} <strong>{label}</strong>, Story <strong>{story}</strong> — '
+            f'<strong>PASS</strong>. All force components within threshold.'
+        )
+    else:
+        narrative = (
+            f'{mtype} <strong>{label}</strong>, Story <strong>{story}</strong> — '
+            f'<strong>{pass_val}</strong>.'
+        )
+
+    if not is_analysis and sect_e != sect_n and sect_e != 'N/A' and sect_n != 'N/A':
+        narrative += f' Section changed: <strong>{sect_e}</strong> &rarr; <strong>{sect_n}</strong>.'
+    elif not is_analysis and sect_e != 'N/A':
+        narrative += f' Section: <strong>{sect_e}</strong>.'
+    if sign_rev == 'YES':
+        narrative += ' <span style="color:#B46400;font-weight:bold">&#9888; Sign reversal on at least one force component.</span>'
+
+    TH = 'padding:8px 12px;text-align:left;font-size:13px;border-bottom:2px solid #ccc;white-space:nowrap'
+    TD = 'padding:7px 12px;font-size:13px;border-bottom:1px solid #e5e5e5'
+
+    def _fmt(val) -> str:
+        if isinstance(val, float):
+            return f'{val:.3f}'
+        return str(val) if val not in (None, '') else 'N/A'
+
+    def _fmt_change(pct_val) -> str:
+        if pct_val == 'INF':
+            return 'INF'
+        if isinstance(pct_val, float):
+            sign = '+' if pct_val >= 0 else ''
+            return f'{sign}{pct_val:.1f}%'
+        return str(pct_val) if pct_val not in (None, '') else 'N/A'
+
+    def _force_row(name: str, exist_val, new_val, pct_val, thresh: float) -> str:
+        no_data = pct_val in ('N/A', None, '')
+        is_fail = not no_data and ((pct_val == 'INF') or (isinstance(pct_val, float) and pct_val > thresh))
+        row_bg  = '#fff0f0' if is_fail else 'transparent'
+        status  = 'FLAG' if is_fail else ('PASS' if not no_data else '—')
+        sc      = '#B22222' if is_fail else ('#228B22' if status == 'PASS' else '#aaa')
+        return (
+            f'<tr style="background:{row_bg}">'
+            f'<td style="{TD};font-weight:bold">{name}</td>'
+            f'<td style="{TD}">{_fmt(exist_val)}</td>'
+            f'<td style="{TD}">{_fmt(new_val)}</td>'
+            f'<td style="{TD}">{_fmt_change(pct_val)}</td>'
+            f'<td style="{TD}">{thresh:.1f}%</td>'
+            f'<td style="{TD};color:{sc};font-weight:bold">{status}</td>'
+            f'</tr>'
+        )
+
+    # Show all FORCE_COMPONENTS; in analysis mode skip slots where both sides are N/A
+    forces_to_show = [
+        c for c in FORCE_COMPONENTS
+        if not is_analysis or not (
+            member.get(f'{c}_Exist') in ('N/A', None, '')
+            and member.get(f'{c}_New') in ('N/A', None, '')
+        )
+    ]
+    force_rows = ''.join(
+        _force_row(c, member.get(f'{c}_Exist'), member.get(f'{c}_New'), member.get(f'{c}_Pct'), threshold)
+        for c in forces_to_show
+    )
+
+    # D/C section — design mode only
+    dc_section = ''
+    if not is_analysis and pass_val not in ('ADDED', 'REMOVED'):
+        def _dc_row(name, exist_val, new_val, pct_val, thresh) -> str:
+            no_data = pct_val in ('N/A', None, '')
+            is_fail = not no_data and ((pct_val == 'INF') or (isinstance(pct_val, float) and pct_val > thresh))
+            row_bg  = '#fff0f0' if is_fail else 'transparent'
+            status  = 'FLAG' if is_fail else ('PASS' if not no_data else '—')
+            sc      = '#B22222' if is_fail else ('#228B22' if status == 'PASS' else '#aaa')
+            return (
+                f'<tr style="background:{row_bg}">'
+                f'<td style="{TD};font-weight:bold">{name}</td>'
+                f'<td style="{TD}">{_fmt(exist_val)}</td>'
+                f'<td style="{TD}">{_fmt(new_val)}</td>'
+                f'<td style="{TD}">{_fmt_change(pct_val)}</td>'
+                f'<td style="{TD}">{thresh:.1f}%</td>'
+                f'<td style="{TD};color:{sc};font-weight:bold">{status}</td>'
+                f'</tr>'
+            )
+        dc_rows_html = (
+            _dc_row('PMM',     member.get('PMM_Exist'),  member.get('PMM_New'),  member.get('PMM_Pct'),  threshold) +
+            _dc_row('V Major', member.get('VMaj_Exist'), member.get('VMaj_New'), member.get('VMaj_Pct'), threshold)
+        )
+        dc_section = f"""
+<h3 style="font-size:14px;text-transform:uppercase;letter-spacing:0.05em;color:#555;margin:24px 0 8px">Demand / Capacity Ratios</h3>
+<table style="width:100%;border-collapse:collapse">
+  <thead>
+    <tr style="background:#f0f0f0">
+      <th style="{TH}">Check</th><th style="{TH}">Existing</th><th style="{TH}">Modified</th>
+      <th style="{TH}">Change</th><th style="{TH}">Threshold</th><th style="{TH}">Status</th>
+    </tr>
+  </thead>
+  <tbody>{dc_rows_html}</tbody>
+</table>"""
+
+    # Summary cards
+    card_s = 'background:#f7f7f7;padding:12px 16px;border-radius:5px;border:1px solid #e0e0e0'
+    lbl_s  = 'color:#777;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px'
+    val_s  = 'font-size:15px;font-weight:500'
+
+    cards_html = f'<div style="{card_s}"><div style="{lbl_s}">Member Type</div><div style="{val_s}">{mtype}</div></div>'
+    cards_html += f'<div style="{card_s}"><div style="{lbl_s}">Story</div><div style="{val_s}">{story}</div></div>'
+
+    if not is_analysis:
+        sect_arrow = f'{sect_e} &rarr; {sect_n}' if sect_e != sect_n else sect_e
+        cards_html += f'<div style="{card_s}"><div style="{lbl_s}">Design Section</div><div style="{val_s}">{sect_arrow}</div></div>'
+        cards_html += (
+            f'<div style="{card_s}"><div style="{lbl_s}">Load Type / Threshold</div>'
+            f'<div style="{val_s}">{(load_type or "").capitalize()} &mdash; {threshold:.1f}%</div></div>'
+        )
+
+    cards_html += (
+        f'<div style="{card_s}"><div style="{lbl_s}">Governing Combo (Existing)</div>'
+        f'<div style="font-size:13px;font-family:monospace">{combo_e}</div></div>'
+        f'<div style="{card_s}"><div style="{lbl_s}">Governing Combo (Modified)</div>'
+        f'<div style="font-size:13px;font-family:monospace">{combo_n}</div></div>'
+    )
+
+    if net_demand and net_demand != 'N/A':
+        nd_color = '#228B22' if net_demand == 'DOWN' else ('#B22222' if net_demand == 'UP' else '#B48200')
+        cards_html += (
+            f'<div style="{card_s}"><div style="{lbl_s}">Net Demand</div>'
+            f'<div style="{val_s};color:{nd_color}">{net_demand}</div></div>'
+        )
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:24px;max-width:960px;color:#222;margin:0 auto">
+
+<div style="background:{banner_bg};color:#fff;padding:12px 20px;border-radius:6px;margin-bottom:18px;font-size:17px;font-weight:bold">
+  {pass_val} &mdash; {mtype} {label}, Story {story}
+</div>
+
+<p style="font-size:14px;line-height:1.65;margin-bottom:20px;padding:12px 16px;background:#fafafa;border-left:4px solid {banner_bg};border-radius:0 4px 4px 0">
+  {narrative}
+</p>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:24px">
+  {cards_html}
+</div>
+
+<h3 style="font-size:14px;text-transform:uppercase;letter-spacing:0.05em;color:#555;margin-bottom:8px">Force Components</h3>
+<table style="width:100%;border-collapse:collapse;margin-bottom:4px">
+  <thead>
+    <tr style="background:#f0f0f0">
+      <th style="{TH}">Force</th><th style="{TH}">Existing</th><th style="{TH}">Modified</th>
+      <th style="{TH}">Change</th><th style="{TH}">Threshold</th><th style="{TH}">Status</th>
+    </tr>
+  </thead>
+  <tbody>{force_rows}</tbody>
+</table>
+{dc_section}
+
+</body></html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -1087,6 +1313,39 @@ class Controller(vkt.Controller):
         results = self._run_all(params)
         beam    = self._find_worst_beam(results)
         html    = _render_beam_detail_html(beam, gravity_thresh, lateral_thresh)
+        return vkt.WebResult(html=html)
+
+    # -- Member detail HTML view -----------------------------------------------
+
+    @vkt.WebView('Member Detail', duration_guess=2)
+    def member_detail_view(self, params, **kwargs):
+        if not params.step1.existing_file or not params.step1.modified_file:
+            raise vkt.UserError('Please upload both model files in Step 1.')
+
+        mode           = params.step1.mode or 'Design Results'
+        p              = params.step2.section_options
+        d              = params.step2.section_detail
+        gravity_thresh = float(p.gravity_threshold or 5)
+        lateral_thresh = float(p.lateral_threshold or 10)
+
+        search_label = (d.detail_label or '').strip()
+        search_story = (d.detail_story or '').strip().lower()
+
+        all_results = self._run_analysis_all(params) if mode == 'Analysis Results' else self._run_all(params)
+
+        member = None
+        if search_label:
+            candidates = [
+                r for r in all_results
+                if str(r.get('Label', '')).strip().lower() == search_label.lower()
+            ]
+            if search_story:
+                candidates = [r for r in candidates if str(r.get('Story', '')).strip().lower() == search_story] or candidates
+            if candidates:
+                # Prefer flagged members if multiple match; otherwise take first
+                member = next((r for r in candidates if r.get('Pass') == 'FLAG'), candidates[0])
+
+        html = _render_member_detail_html(member, gravity_thresh, lateral_thresh, mode)
         return vkt.WebResult(html=html)
 
     # -- Typed member-class tabs -----------------------------------------------
