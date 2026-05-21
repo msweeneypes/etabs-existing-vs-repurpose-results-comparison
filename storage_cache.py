@@ -7,7 +7,9 @@ Level 2: Viktor Storage API (workspace scope) — survives restarts, shared
          (e.g., unit tests, offline dev without a workspace).
 
 Keys are short MD5 slugs so they fit within the 64-char historical limit.
+Values are gzip-compressed pickle to reduce Storage payload size.
 """
+import gzip
 import hashlib
 import pickle
 
@@ -30,7 +32,11 @@ def get_cached(prefix: str, cache_key):
         storage = Storage()
         key = _storage_key(prefix, cache_key)
         file_obj = storage.get(key, scope='workspace')
-        value = pickle.loads(file_obj.getvalue_binary())
+        raw = file_obj.getvalue_binary()
+        try:
+            value = pickle.loads(gzip.decompress(raw))
+        except Exception:
+            value = pickle.loads(raw)  # backward compat with uncompressed entries
         _MEMORY[mem_key] = value   # warm the in-process cache for this session
         return value
     except Exception:
@@ -46,6 +52,6 @@ def set_cached(prefix: str, cache_key, value) -> None:
         from viktor import Storage, File
         storage = Storage()
         key = _storage_key(prefix, cache_key)
-        storage.set(key, File.from_data(pickle.dumps(value)), scope='workspace')
+        storage.set(key, File.from_data(gzip.compress(pickle.dumps(value), compresslevel=6)), scope='workspace')
     except Exception:
         pass   # in-process cache still works; Storage unavailable is non-fatal

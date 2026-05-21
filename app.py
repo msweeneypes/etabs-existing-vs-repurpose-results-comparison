@@ -16,6 +16,7 @@ from comparison import (
 from analysis_comparison import (
     run_analysis_comparison, ANALYSIS_FORCES_SHEETS, _get_parsed_analysis_file,
 )
+from storage_cache import get_cached, set_cached
 
 # ---------------------------------------------------------------------------
 # Column headers
@@ -70,14 +71,6 @@ _RESULT_COLORS = {
     'WARN':    vkt.Color(180, 130, 0),
     'ADDED':   vkt.Color(30, 100, 200),
     'REMOVED': vkt.Color(180, 100, 0),
-}
-
-_CHART_COLORS = {
-    'FLAG':    '#B22222',
-    'WARN':    '#B48200',
-    'PASS':    '#228B22',
-    'ADDED':   '#1E64C8',
-    'REMOVED': '#B46400',
 }
 
 # Member type helpers for typed tabs
@@ -218,11 +211,6 @@ def _recompute_typed_fail_reason(
     return {**r, 'FailReason': ''}
 
 
-def _story_sort_key(name: str) -> tuple:
-    """Sort stories by trailing digits (lowest first), then alphabetical."""
-    m = re.search(r'(\d+)', str(name))
-    return (int(m.group(1)) if m else 0, str(name))
-
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -295,16 +283,14 @@ near-instant.
     )
 
     step2 = vkt.Step('Configure & Compare', views=[
+        'results_table',
         'braces_table',
         'columns_table',
         'beams_table',
-        'key_metrics',
-        'results_table',
-        'results_detail',
-        'results_chart',
-        'summary_table',
-        'beam_detail_view',
         'member_detail_view',
+        'key_metrics',
+        'summary_table',
+        'results_detail',
     ])
 
     step2.section_about = vkt.Section('How This Works')
@@ -563,188 +549,6 @@ def _numeric_pct(val) -> float:
     return 0.0
 
 
-def _render_beam_detail_html(beam: Optional[dict], gravity_thresh: float, lateral_thresh: float) -> str:
-    if beam is None:
-        return (
-            '<p style="font-family:sans-serif;padding:24px;color:#555;font-size:15px;">'
-            'No beam results to display. Ensure beams are included in the member type filter '
-            'and both files are uploaded.</p>'
-        )
-
-    load_type = beam.get('LoadType', 'gravity')
-    threshold = lateral_thresh if load_type == 'lateral' else gravity_thresh
-    pass_val  = beam.get('Pass', '')
-    label     = beam.get('Label', '')
-    story     = beam.get('Story', '')
-    sect_e    = beam.get('DesignSection_Exist', 'N/A')
-    sect_n    = beam.get('DesignSection_New', 'N/A')
-    combo_e   = beam.get('GovCombo_Exist', 'N/A')
-    combo_n   = beam.get('GovCombo_New', 'N/A')
-    fail_rsn  = beam.get('FailReason', '')
-    sign_rev  = beam.get('SignReversal', '')
-
-    banner_bg = '#B22222' if pass_val == 'FLAG' else '#228B22'
-
-    if pass_val == 'FLAG':
-        result_phrase = '<span style="font-weight:bold">FLAGGED</span>'
-        narrative = (
-            f'Beam <strong>{label}</strong> on Story <strong>{story}</strong> {result_phrase} — '
-            f'{fail_rsn}. Review required; FLAG does not imply a design failure.'
-        )
-    else:
-        result_phrase = '<span style="font-weight:bold">PASSED</span>'
-        narrative = (
-            f'Beam <strong>{label}</strong> on Story <strong>{story}</strong> {result_phrase} '
-            f'all threshold checks ({load_type} threshold: {threshold:.1f}%).'
-        )
-    if sect_e != sect_n:
-        narrative += f' Section changed from <strong>{sect_e}</strong> to <strong>{sect_n}</strong>.'
-    else:
-        narrative += f' Section unchanged: <strong>{sect_e}</strong>.'
-    if sign_rev == 'YES':
-        narrative += ' <span style="color:#B46400;font-weight:bold">&#9888; Sign reversal detected on at least one force component.</span>'
-
-    TH = 'padding:8px 12px;text-align:left;font-size:13px;border-bottom:2px solid #ccc;white-space:nowrap'
-    TD = 'padding:7px 12px;font-size:13px;border-bottom:1px solid #e5e5e5'
-
-    def _fmt(val) -> str:
-        if isinstance(val, float):
-            return f'{val:.3f}'
-        return str(val) if val not in (None, '') else 'N/A'
-
-    def _fmt_change(pct_val) -> str:
-        if pct_val == 'INF':
-            return 'INF'
-        if isinstance(pct_val, float):
-            sign = '+' if pct_val >= 0 else ''
-            return f'{sign}{pct_val:.1f}%'
-        return 'N/A'
-
-    def _force_row(name: str, exist_val, new_val, pct_val, thresh: float) -> str:
-        is_fail = (pct_val == 'INF') or (isinstance(pct_val, float) and pct_val > thresh)
-        row_bg  = '#fff0f0' if is_fail else 'transparent'
-        status  = 'FLAG' if is_fail else 'PASS'
-        sc      = '#B22222' if is_fail else '#228B22'
-        return (
-            f'<tr style="background:{row_bg}">'
-            f'<td style="{TD};font-weight:bold">{name}</td>'
-            f'<td style="{TD}">{_fmt(exist_val)}</td>'
-            f'<td style="{TD}">{_fmt(new_val)}</td>'
-            f'<td style="{TD}">{_fmt_change(pct_val)}</td>'
-            f'<td style="{TD}">{thresh:.1f}%</td>'
-            f'<td style="{TD};color:{sc};font-weight:bold">{status}</td>'
-            f'</tr>'
-        )
-
-    force_rows = ''.join(
-        _force_row(
-            c,
-            beam.get(f'{c}_Exist'), beam.get(f'{c}_New'), beam.get(f'{c}_Pct'), threshold
-        )
-        for c in FORCE_COMPONENTS
-    )
-
-    def _dc_row(name: str, combo_exist: str, combo_new: str, exist_val, new_val, pct_val, thresh: float) -> str:
-        is_fail = (pct_val == 'INF') or (isinstance(pct_val, float) and pct_val > thresh)
-        row_bg  = '#fff0f0' if is_fail else 'transparent'
-        status  = 'FLAG' if is_fail else 'PASS'
-        sc      = '#B22222' if is_fail else '#228B22'
-        ce = combo_exist if combo_exist and combo_exist != 'N/A' else '—'
-        cn = combo_new   if combo_new   and combo_new   != 'N/A' else '—'
-        return (
-            f'<tr style="background:{row_bg}">'
-            f'<td style="{TD};font-weight:bold">{name}</td>'
-            f'<td style="{TD};font-family:monospace;font-size:12px">{ce}</td>'
-            f'<td style="{TD};font-family:monospace;font-size:12px">{cn}</td>'
-            f'<td style="{TD}">{_fmt(exist_val)}</td>'
-            f'<td style="{TD}">{_fmt(new_val)}</td>'
-            f'<td style="{TD}">{_fmt_change(pct_val)}</td>'
-            f'<td style="{TD}">{thresh:.1f}%</td>'
-            f'<td style="{TD};color:{sc};font-weight:bold">{status}</td>'
-            f'</tr>'
-        )
-
-    dc_rows = (
-        _dc_row('PMM', combo_e, combo_n,
-                beam.get('PMM_Exist'), beam.get('PMM_New'), beam.get('PMM_Pct'), threshold) +
-        _dc_row('V Major', combo_e, combo_n,
-                beam.get('VMaj_Exist'), beam.get('VMaj_New'), beam.get('VMaj_Pct'), threshold)
-    )
-
-    card_style = 'background:#f7f7f7;padding:12px 16px;border-radius:5px;border:1px solid #e0e0e0'
-    label_style = 'color:#777;font-size:11px;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px'
-    value_style = 'font-size:15px;font-weight:500'
-
-    sect_arrow = f'{sect_e} &rarr; {sect_n}' if sect_e != sect_n else sect_e
-
-    html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"></head>
-<body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:24px;max-width:960px;color:#222;margin:0 auto">
-
-<div style="background:{banner_bg};color:#fff;padding:12px 20px;border-radius:6px;margin-bottom:18px;font-size:17px;font-weight:bold">
-  {pass_val} &mdash; Beam {label}, Story {story}
-  <span style="font-weight:normal;font-size:13px;margin-left:16px;opacity:0.9">Worst beam auto-selected</span>
-</div>
-
-<p style="font-size:14px;line-height:1.65;margin-bottom:20px;padding:12px 16px;background:#fafafa;border-left:4px solid {banner_bg};border-radius:0 4px 4px 0">
-  {narrative}
-</p>
-
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:24px">
-  <div style="{card_style}">
-    <div style="{label_style}">Design Section</div>
-    <div style="{value_style}">{sect_arrow}</div>
-  </div>
-  <div style="{card_style}">
-    <div style="{label_style}">Load Type / Threshold</div>
-    <div style="{value_style}">{load_type.capitalize()} &mdash; {threshold:.1f}%</div>
-  </div>
-  <div style="{card_style}">
-    <div style="{label_style}">Governing Combo (Existing)</div>
-    <div style="font-size:13px;font-family:monospace">{combo_e}</div>
-  </div>
-  <div style="{card_style}">
-    <div style="{label_style}">Governing Combo (Modified)</div>
-    <div style="font-size:13px;font-family:monospace">{combo_n}</div>
-  </div>
-</div>
-
-<h3 style="font-size:14px;text-transform:uppercase;letter-spacing:0.05em;color:#555;margin-bottom:8px">Force Components</h3>
-<table style="width:100%;border-collapse:collapse;margin-bottom:28px">
-  <thead>
-    <tr style="background:#f0f0f0">
-      <th style="{TH}">Force</th>
-      <th style="{TH}">Existing</th>
-      <th style="{TH}">Modified</th>
-      <th style="{TH}">Change</th>
-      <th style="{TH}">Threshold</th>
-      <th style="{TH}">Status</th>
-    </tr>
-  </thead>
-  <tbody>{force_rows}</tbody>
-</table>
-
-<h3 style="font-size:14px;text-transform:uppercase;letter-spacing:0.05em;color:#555;margin-bottom:8px">Demand / Capacity Ratios</h3>
-<table style="width:100%;border-collapse:collapse">
-  <thead>
-    <tr style="background:#f0f0f0">
-      <th style="{TH}">Check</th>
-      <th style="{TH}">Combo (Existing)</th>
-      <th style="{TH}">Combo (Modified)</th>
-      <th style="{TH}">Existing</th>
-      <th style="{TH}">Modified</th>
-      <th style="{TH}">Change</th>
-      <th style="{TH}">Threshold</th>
-      <th style="{TH}">Status</th>
-    </tr>
-  </thead>
-  <tbody>{dc_rows}</tbody>
-</table>
-
-</body></html>"""
-    return html
-
-
 # ---------------------------------------------------------------------------
 # Generic member detail HTML renderer
 # ---------------------------------------------------------------------------
@@ -763,13 +567,12 @@ def _render_member_detail_html(
     gravity_thresh: float,
     lateral_thresh: float,
     mode: str,
+    subtitle: Optional[str] = None,
 ) -> str:
     if member is None:
         return (
             '<p style="font-family:sans-serif;padding:24px;color:#555;font-size:15px;">'
-            'Enter a member label in <strong>Member Detail</strong> above to view its '
-            'detail card. The label must match exactly as shown in the results tables '
-            '(e.g. "C12", "B5"). Optionally enter a story to disambiguate.</p>'
+            'No members available to display.</p>'
         )
 
     is_analysis = (mode == 'Analysis Results')
@@ -931,6 +734,7 @@ def _render_member_detail_html(
 
 <div style="background:{banner_bg};color:#fff;padding:12px 20px;border-radius:6px;margin-bottom:18px;font-size:17px;font-weight:bold">
   {pass_val} &mdash; {mtype} {label}, Story {story}
+  {f'<span style="font-weight:normal;font-size:13px;margin-left:16px;opacity:0.85">{subtitle}</span>' if subtitle else ''}
 </div>
 
 <p style="font-size:14px;line-height:1.65;margin-bottom:20px;padding:12px 16px;background:#fafafa;border-left:4px solid {banner_bg};border-radius:0 4px 4px 0">
@@ -1070,77 +874,6 @@ class Controller(vkt.Controller):
             ])
 
         return vkt.TableResult(data, column_headers=DETAIL_HEADERS)
-
-    # -- Plotly chart --------------------------------------------------------
-
-    @vkt.PlotlyView('Results Chart', duration_guess=2)
-    def results_chart(self, params, **kwargs):
-        if not params.step1.existing_file or not params.step1.modified_file:
-            raise vkt.UserError('Please upload both model files in Step 1.')
-
-        mode = params.step1.mode or 'Design Results'
-        all_results = self._run_analysis_all(params) if mode == 'Analysis Results' else self._run_all(params)
-        if not all_results:
-            raise vkt.UserError('No data to chart.')
-
-        import pandas as pd
-        from plotly.subplots import make_subplots
-        import plotly.graph_objects as go
-
-        df = pd.DataFrame(all_results)[['Story', 'MemberType', 'Pass']]
-
-        member_types = sorted(df['MemberType'].unique())
-        stories = sorted(df['Story'].unique(), key=_story_sort_key, reverse=True)
-        n_types = len(member_types)
-
-        grouped = (
-            df.groupby(['Story', 'MemberType', 'Pass'])
-            .size()
-            .reset_index(name='Count')
-        )
-
-        fig = make_subplots(
-            rows=1, cols=n_types,
-            subplot_titles=member_types,
-            shared_yaxes=True,
-            horizontal_spacing=0.04,
-        )
-
-        status_order = ['FLAG', 'WARN', 'PASS', 'ADDED', 'REMOVED']
-        for col_idx, mtype in enumerate(member_types, start=1):
-            sub = grouped[grouped['MemberType'] == mtype]
-            for status in status_order:
-                s = sub[sub['Pass'] == status]
-                counts_by_story = dict(zip(s['Story'], s['Count']))
-                x_vals = [counts_by_story.get(st, 0) for st in stories]
-                fig.add_trace(
-                    go.Bar(
-                        name=status,
-                        x=x_vals,
-                        y=stories,
-                        orientation='h',
-                        marker_color=_CHART_COLORS[status],
-                        showlegend=(col_idx == 1),
-                        legendgroup=status,
-                        hovertemplate='%{y}: %{x}<extra>' + status + '</extra>',
-                    ),
-                    row=1, col=col_idx,
-                )
-
-        fig.update_layout(
-            barmode='stack',
-            title={
-                'text': 'Members by Story and Status (highest story at top)'
-                        '<br><sup style="font-size:11px;color:#777">All members shown — independent of display filter</sup>',
-                'x': 0.5, 'xanchor': 'center',
-            },
-            height=max(420, 28 * len(stories) + 120),
-            legend=dict(orientation='h', yanchor='bottom', y=1.05,
-                        xanchor='right', x=1),
-            margin=dict(l=10, r=20, t=80, b=40),
-        )
-
-        return vkt.PlotlyResult(fig)
 
     # -- Summary table -------------------------------------------------------
 
@@ -1293,28 +1026,6 @@ class Controller(vkt.Controller):
 
     # -- Beam detail HTML view -----------------------------------------------
 
-    @vkt.WebView('Worst Beam (Design)', duration_guess=2)
-    def beam_detail_view(self, params, **kwargs):
-        if not params.step1.existing_file or not params.step1.modified_file:
-            raise vkt.UserError('Please upload both model files in Step 1.')
-
-        if (params.step1.mode or 'Design Results') == 'Analysis Results':
-            html = (
-                '<p style="font-family:sans-serif;padding:24px;color:#555;font-size:15px;">'
-                'Beam detail view is only available in Design mode.'
-                '</p>'
-            )
-            return vkt.WebResult(html=html)
-
-        p = params.step2.section_options
-        gravity_thresh  = float(p.gravity_threshold or 5)
-        lateral_thresh  = float(p.lateral_threshold or 10)
-
-        results = self._run_all(params)
-        beam    = self._find_worst_beam(results)
-        html    = _render_beam_detail_html(beam, gravity_thresh, lateral_thresh)
-        return vkt.WebResult(html=html)
-
     # -- Member detail HTML view -----------------------------------------------
 
     @vkt.WebView('Member Detail', duration_guess=2)
@@ -1333,7 +1044,6 @@ class Controller(vkt.Controller):
 
         all_results = self._run_analysis_all(params) if mode == 'Analysis Results' else self._run_all(params)
 
-        member = None
         if search_label:
             candidates = [
                 r for r in all_results
@@ -1341,11 +1051,18 @@ class Controller(vkt.Controller):
             ]
             if search_story:
                 candidates = [r for r in candidates if str(r.get('Story', '')).strip().lower() == search_story] or candidates
-            if candidates:
-                # Prefer flagged members if multiple match; otherwise take first
-                member = next((r for r in candidates if r.get('Pass') == 'FLAG'), candidates[0])
+            member = next((r for r in candidates if r.get('Pass') == 'FLAG'), candidates[0] if candidates else None)
+            subtitle = None
+        else:
+            # No label entered — default to worst flagged member
+            if mode == 'Analysis Results':
+                member = self._find_worst_member(all_results)
+                subtitle = 'Worst flagged member auto-selected — enter a label above to view any member'
+            else:
+                member = self._find_worst_beam(all_results)
+                subtitle = 'Worst flagged beam auto-selected — enter a label above to view any member'
 
-        html = _render_member_detail_html(member, gravity_thresh, lateral_thresh, mode)
+        html = _render_member_detail_html(member, gravity_thresh, lateral_thresh, mode, subtitle=subtitle)
         return vkt.WebResult(html=html)
 
     # -- Typed member-class tabs -----------------------------------------------
@@ -1538,6 +1255,21 @@ class Controller(vkt.Controller):
 
         return max(pool, key=score)
 
+    def _find_worst_member(self, results: list) -> Optional[dict]:
+        candidates = [r for r in results if r.get('Pass') not in ('ADDED', 'REMOVED')]
+        flags = [r for r in candidates if r.get('Pass') == 'FLAG']
+        pool  = flags if flags else candidates
+        if not pool:
+            return None
+
+        def score(r):
+            pct = r.get('WorstPct')
+            if pct == 'INF':
+                return 999.0
+            return float(pct) if isinstance(pct, float) else -1.0
+
+        return max(pool, key=score)
+
     # -- CSV export ----------------------------------------------------------
 
     def download_csv(self, params, **kwargs):
@@ -1591,12 +1323,15 @@ class Controller(vkt.Controller):
             failure_lines = []
             for r in top60:
                 status = r.get('Pass', '')
+                def _fc(c):
+                    e, n, pct = r.get(f'{c}_Exist', 'N/A'), r.get(f'{c}_New', 'N/A'), r.get(f'{c}_Pct', 'N/A')
+                    pct_str = f'+{pct:.1f}%' if isinstance(pct, float) else str(pct)
+                    return f'{c}: {e}→{n} ({pct_str})'
+                forces_str = ' | '.join(_fc(c) for c in FORCE_COMPONENTS if r.get(f'{c}_Exist') not in ('N/A', None, '') or r.get(f'{c}_New') not in ('N/A', None, ''))
                 failure_lines.append(
                     f"- [{status}] {r.get('MemberType')} {r.get('Label')} (Story {r.get('Story')}): "
                     f"{r.get('FailReason', 'N/A')} | worst: {r.get('WorstPct', 'N/A')}% | "
-                    f"P: {r.get('P_Exist', 'N/A')} → {r.get('P_New', 'N/A')} | "
-                    f"M3: {r.get('M3_Exist', 'N/A')} → {r.get('M3_New', 'N/A')} | "
-                    f"combo (new): {r.get('GovCombo_New', 'N/A')}"
+                    f"{forces_str} | combo (new): {r.get('GovCombo_New', 'N/A')}"
                 )
             failure_block = "\n".join(failure_lines) if failure_lines else "None — all members within threshold."
             system_prompt = (
@@ -1631,14 +1366,23 @@ class Controller(vkt.Controller):
                     if r.get('DesignSection_Exist') != r.get('DesignSection_New')
                     else r.get('DesignSection_Exist', 'N/A')
                 )
-                sign_rev = r.get('SignReversal', '')
+                sign_rev  = r.get('SignReversal', '')
                 sign_note = f' | sign rev: {sign_rev}' if sign_rev else ''
-                status = r.get('Pass', '')
+                status    = r.get('Pass', '')
+                def _fc(c):
+                    e, n, pct = r.get(f'{c}_Exist', 'N/A'), r.get(f'{c}_New', 'N/A'), r.get(f'{c}_Pct', 'N/A')
+                    pct_str = f'+{pct:.1f}%' if isinstance(pct, float) else str(pct)
+                    return f'{c}: {e}→{n} ({pct_str})'
+                forces_str = ' | '.join(_fc(c) for c in FORCE_COMPONENTS)
+                pmm_pct = r.get('PMM_Pct', 'N/A')
+                pmm_pct_str = f'+{pmm_pct:.1f}%' if isinstance(pmm_pct, float) else str(pmm_pct)
                 failure_lines.append(
                     f"- [{status}] {r.get('MemberType')} {r.get('Label')} (Story {r.get('Story')}): "
                     f"{r.get('FailReason', 'N/A')} | net demand: {r.get('NetDemand', 'N/A')} | "
                     f"load type: {r.get('LoadType', 'N/A')} | section: {sect_change} | "
-                    f"PMM: {r.get('PMM_Exist', 'N/A')} → {r.get('PMM_New', 'N/A')}{sign_note}"
+                    f"{forces_str} | "
+                    f"PMM: {r.get('PMM_Exist', 'N/A')}→{r.get('PMM_New', 'N/A')} ({pmm_pct_str})"
+                    f"{sign_note}"
                 )
             failure_block = "\n".join(failure_lines) if failure_lines else "None — all members are passing."
             system_prompt = (
@@ -1652,8 +1396,9 @@ class Controller(vkt.Controller):
                 f"still below 0.95 or all forces decreased — threshold tripped but member is not overstressed.\n\n"
                 f"Flagged / warned members (sorted by severity):\n{failure_block}\n\n"
                 f"Each line: status, member type, label, story, fail reason, net demand direction, "
-                f"load type, section change, PMM ratio change, sign reversal if any.\n\n"
-                f"Answer concisely in engineering terms. Reference specific members and stories. "
+                f"load type, section change, all force components (exist→modified, % change), "
+                f"PMM ratio change, sign reversal if any.\n\n"
+                f"Answer concisely in engineering terms. Reference specific members, stories, and force values. "
                 f"If asked about a member not listed, note it is passing."
             )
 
@@ -1680,54 +1425,78 @@ class Controller(vkt.Controller):
     # -- Shared helpers ------------------------------------------------------
 
     def _run(self, params):
-        """Filtered results (respects display_filter param)."""
-        p = params.step2.section_options
-        results = run_comparison(
-            existing_file=params.step1.existing_file.file,
-            modified_file=params.step1.modified_file.file,
-            member_type_filter='All',
-            gravity_threshold=float(p.gravity_threshold or 5),
-            lateral_threshold=float(p.lateral_threshold or 10),
-            show_failures_only=(p.display_filter == 'Failures Only'),
-        )
-        return _postprocess_results(results)
+        """Filtered results (respects display_filter param). Delegates to _run_all."""
+        results = self._run_all(params)
+        if (params.step2.section_options.display_filter or 'Failures Only') == 'Failures Only':
+            return [r for r in results if r.get('Pass') == 'FLAG']
+        return results
 
     def _run_all(self, params):
-        """Unfiltered results — used by chart, summary, key metrics, CSV, and typed tabs."""
-        p = params.step2.section_options
+        """Unfiltered post-processed results, cached at the postprocess level.
+
+        Reduces cold-worker Storage reads from 3 (parse×2 + cmp) down to 1
+        for every view after the first call with a given file+threshold combo.
+        """
+        p    = params.step2.section_options
+        grav = float(p.gravity_threshold or 5)
+        lat  = float(p.lateral_threshold or 10)
+        ef   = params.step1.existing_file.file
+        nf   = params.step1.modified_file.file
+        # _get_parsed_file downloads + parses once and warms _MEMORY so
+        # run_comparison's internal _get_parsed_file call is a free cache hit.
+        eh, _ = _get_parsed_file(ef)
+        nh, _ = _get_parsed_file(nf)
+        key  = (eh, nh, grav, lat)
+
+        cached = get_cached('etabs_post', key)
+        if cached is not None:
+            return cached
+
         results = run_comparison(
-            existing_file=params.step1.existing_file.file,
-            modified_file=params.step1.modified_file.file,
+            existing_file=ef,
+            modified_file=nf,
             member_type_filter='All',
-            gravity_threshold=float(p.gravity_threshold or 5),
-            lateral_threshold=float(p.lateral_threshold or 10),
+            gravity_threshold=grav,
+            lateral_threshold=lat,
             show_failures_only=False,
         )
-        return _postprocess_results(results)
+        processed = _postprocess_results(results)
+        set_cached('etabs_post', key, processed)
+        return processed
 
     def _run_analysis(self, params):
-        """Filtered analysis results."""
-        p = params.step2.section_options
-        return run_analysis_comparison(
-            existing_file=params.step1.existing_file.file,
-            modified_file=params.step1.modified_file.file,
-            member_type_filter='All',
-            warn_threshold=float(p.warn_threshold or 5),
-            fail_threshold=float(p.fail_threshold or 10),
-            show_failures_only=(p.display_filter == 'Failures Only'),
-        )
+        """Filtered analysis results. Delegates to _run_analysis_all."""
+        results = self._run_analysis_all(params)
+        if (params.step2.section_options.display_filter or 'Failures Only') == 'Failures Only':
+            return [r for r in results if r.get('Pass') == 'FLAG']
+        return results
 
     def _run_analysis_all(self, params):
-        """Unfiltered analysis results — used by chart, summary, key metrics, CSV, and typed tabs."""
-        p = params.step2.section_options
-        return run_analysis_comparison(
-            existing_file=params.step1.existing_file.file,
-            modified_file=params.step1.modified_file.file,
+        """Unfiltered analysis results, cached at the postprocess level."""
+        p    = params.step2.section_options
+        warn = float(p.warn_threshold or 5)
+        fail = float(p.fail_threshold or 10)
+        ef   = params.step1.existing_file.file
+        nf   = params.step1.modified_file.file
+        from analysis_comparison import _get_parsed_analysis_file
+        eh, _ = _get_parsed_analysis_file(ef)
+        nh, _ = _get_parsed_analysis_file(nf)
+        key  = (eh, nh, warn, fail, 'analysis')
+
+        cached = get_cached('etabs_post', key)
+        if cached is not None:
+            return cached
+
+        results = run_analysis_comparison(
+            existing_file=ef,
+            modified_file=nf,
             member_type_filter='All',
-            warn_threshold=float(p.warn_threshold or 5),
-            fail_threshold=float(p.fail_threshold or 10),
+            warn_threshold=warn,
+            fail_threshold=fail,
             show_failures_only=False,
         )
+        set_cached('etabs_post', key, results)
+        return results
 
     def _run_typed(self, params, member_type: str) -> list:
         """Filtered + focused results for one member type (typed review tabs).
