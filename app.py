@@ -161,6 +161,63 @@ def _postprocess_results(results: list) -> list:
     return out
 
 
+def _recompute_typed_fail_reason(
+    r: dict, gov_forces: list, force_thresholds: dict,
+    grav_thresh: float, lat_thresh: float,
+    warn_thresh: float, fail_thresh: float,
+    is_analysis: bool, status: str,
+) -> dict:
+    """Return a copy of r with FailReason restricted to gov_forces above their abs threshold.
+
+    Prevents low-magnitude forces (e.g. M2 = 0.3 kip-ft) or non-governing forces
+    (e.g. M2 for beams) from appearing as the primary flag reason in the typed tabs.
+    """
+    if is_analysis:
+        pct_threshold = fail_thresh if status == 'FLAG' else warn_thresh
+        load_type = None
+        sign_tag = ''
+    else:
+        load_type = r.get('LoadType', 'gravity')
+        pct_threshold = lat_thresh if load_type == 'lateral' else grav_thresh
+        sign_tag = ' [sign rev]' if r.get('SignReversal') == 'YES' else ''
+
+    def _max_abs(f):
+        return max(
+            (abs(r[k]) for k in (f'{f}_Exist', f'{f}_New') if isinstance(r.get(k), (int, float))),
+            default=0.0,
+        )
+
+    # Priority 1: INF change on a gov force above its abs threshold
+    for f in gov_forces:
+        if r.get(f'{f}_Pct') == 'INF' and _max_abs(f) >= force_thresholds.get(f, 0.0):
+            new_reason = (
+                f'{f} INF > {pct_threshold:.0f}%' if is_analysis
+                else f'{f} INF ({load_type}){sign_tag}'
+            )
+            return {**r, 'FailReason': new_reason}
+
+    # Priority 2: worst % exceeding pct_threshold on a gov force above its abs threshold
+    worst_label = None
+    worst_pct_val = 0.0
+    for f in gov_forces:
+        pct = r.get(f'{f}_Pct')
+        if not isinstance(pct, float) or pct <= pct_threshold:
+            continue
+        if _max_abs(f) >= force_thresholds.get(f, 0.0) and pct > worst_pct_val:
+            worst_pct_val = pct
+            worst_label = f
+
+    if worst_label is not None:
+        new_reason = (
+            f'{worst_label} +{worst_pct_val:.1f}% > {pct_threshold:.0f}%' if is_analysis
+            else f'{worst_label} +{worst_pct_val:.1f}% > {pct_threshold:.0f}% {load_type}{sign_tag}'
+        )
+        return {**r, 'FailReason': new_reason}
+
+    # No qualifying force found among gov_forces above abs threshold
+    return {**r, 'FailReason': ''}
+
+
 def _story_sort_key(name: str) -> tuple:
     """Sort stories by trailing digits (lowest first), then alphabetical."""
     m = re.search(r'(\d+)', str(name))
@@ -1421,6 +1478,7 @@ class Controller(vkt.Controller):
         """
         p = params.step2.section_options
         mode = params.step1.mode or 'Design Results'
+        is_analysis = (mode == 'Analysis Results')
         force_thresholds = {
             'P':  float(p.thresh_P  if p.thresh_P  is not None else 5.0),
             'M3': float(p.thresh_M3 if p.thresh_M3 is not None else 20.0),
@@ -1428,6 +1486,10 @@ class Controller(vkt.Controller):
             'V2': float(p.thresh_V2 if p.thresh_V2 is not None else 5.0),
             'V3': float(p.thresh_V3 if p.thresh_V3 is not None else 0.0),
         }
+        grav_thresh  = float(p.gravity_threshold or 5)
+        lat_thresh   = float(p.lateral_threshold or 10)
+        warn_thresh  = float(p.warn_threshold or 5)
+        fail_thresh  = float(p.fail_threshold or 10)
         hide_decreases     = p.hide_decreases if p.hide_decreases is not None else True
         show_added_removed = p.show_added_removed if p.show_added_removed is not None else True
         display_filter     = p.display_filter or 'Failures Only'
@@ -1452,15 +1514,25 @@ class Controller(vkt.Controller):
                 continue
 
             # Per-force absolute thresholds.
-            # For FLAG/WARN: at least one *increasing* governing force must be above its limit.
+            # For FLAG/WARN: at least one *flagging* governing force (exceeds the % threshold
+            #   or is INF) must also be above the abs limit. Forces that trip the % threshold
+            #   but are below the abs minimum are excluded — the member is filtered out
+            #   entirely rather than shown with a misleading or empty reason.
             # For PASS: at least one governing force (either model) must be above its limit.
             if status not in ('ADDED', 'REMOVED'):
                 if status in ('FLAG', 'WARN'):
+                    if is_analysis:
+                        member_pct_thresh = fail_thresh if status == 'FLAG' else warn_thresh
+                    else:
+                        _lt = r.get('LoadType', 'gravity')
+                        member_pct_thresh = lat_thresh if _lt == 'lateral' else grav_thresh
                     any_meaningful = False
                     for f in gov_forces:
                         pct = r.get(f'{f}_Pct')
-                        if pct != 'INF' and not (isinstance(pct, float) and pct > 0):
-                            continue  # force not increasing — skip
+                        # Must be flagging (INF or exceeds % threshold), not just increasing
+                        is_flagging = pct == 'INF' or (isinstance(pct, float) and pct > member_pct_thresh)
+                        if not is_flagging:
+                            continue
                         limit = force_thresholds.get(f, 0.0)
                         max_f = max(
                             (abs(r.get(k)) for k in (f'{f}_Exist', f'{f}_New')
@@ -1491,6 +1563,14 @@ class Controller(vkt.Controller):
             # Display filter
             if display_filter == 'Failures Only' and status == 'PASS':
                 continue
+
+            # Recompute FailReason for FLAG/WARN to only reference gov_forces above abs threshold
+            if status in ('FLAG', 'WARN'):
+                r = _recompute_typed_fail_reason(
+                    r, gov_forces, force_thresholds,
+                    grav_thresh, lat_thresh, warn_thresh, fail_thresh,
+                    is_analysis, status,
+                )
 
             out.append(r)
 
