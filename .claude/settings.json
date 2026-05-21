@@ -14,7 +14,9 @@
       "Bash(dir /s /b \"c:\\\\Users\\\\msweeney\\\\viktor-apps\\\\etabs-existing-vs-repurpose-results-comparison\" *.py)",
       "Bash(dir c:\\\\Users\\\\msweeney\\\\viktor-apps\\\\etabs-existing-vs-repurpose-results-comparison /B /S)",
       "Bash(findstr /E \"\\\\.py$\")",
-      "Bash(findstr /V \"venv\")"
+      "Bash(findstr /V \"venv\")",
+      "Bash(Get-ChildItem -File -Name *.py)",
+      "Bash(Select-Object -First 20)"
     ]
   }
 }

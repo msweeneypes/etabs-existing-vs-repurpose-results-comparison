@@ -23,12 +23,12 @@ from analysis_comparison import (
 
 OVERVIEW_HEADERS = [
     'Story', 'Label', 'Type',
-    'Section (Exist)', 'Section (New)',
     'Load Type',
+    'Section (Exist)', 'Section (New)',
     'PMM (Exist)', 'PMM (New)', 'PMM (%)',
-    'V Major (%)',
+    'V Major D/C',
     'Worst Force (%)',
-    'Fail Reason',
+    'Flag Reason',
     'Result',
 ]
 
@@ -40,15 +40,15 @@ DETAIL_HEADERS = [
     'V3 (Exist)', 'V3 (New)', 'V3 (%)',
     'M2 (Exist)', 'M2 (New)', 'M2 (%)',
     'M3 (Exist)', 'M3 (New)', 'M3 (%)',
-    'Net Demand', 'Fail Reason', 'Result',
+    'Net Demand', 'Flag Reason', 'Result',
 ]
 
 SUMMARY_HEADERS = ['Story', 'Type', 'Total', 'PASS', 'WARN', 'FLAG', 'ADDED', 'REMOVED']
 
 ANALYSIS_OVERVIEW_HEADERS = [
     'Story', 'Label', 'Type',
-    'P (%)', 'V2 (%)', 'M2 (%)', 'M3 (%)',
-    'Worst (%)', 'Fail Reason', 'Result',
+    'P (New)', 'P (%)', 'V2 (New)', 'V2 (%)', 'M2 (New)', 'M2 (%)', 'M3 (New)', 'M3 (%)',
+    'Worst (%)', 'Flag Reason', 'Result',
 ]
 
 ANALYSIS_DETAIL_HEADERS = [
@@ -57,7 +57,7 @@ ANALYSIS_DETAIL_HEADERS = [
     'V2 (Exist)', 'V2 (New)', 'V2 (%)',
     'M2 (Exist)', 'M2 (New)', 'M2 (%)',
     'M3 (Exist)', 'M3 (New)', 'M3 (%)',
-    'Worst (%)', 'Fail Reason', 'Result',
+    'Worst (%)', 'Flag Reason', 'Result',
 ]
 
 # ---------------------------------------------------------------------------
@@ -241,11 +241,11 @@ near-instant.
         'braces_table',
         'columns_table',
         'beams_table',
+        'key_metrics',
         'results_table',
         'results_detail',
         'results_chart',
         'summary_table',
-        'key_metrics',
         'beam_detail_view',
     ])
 
@@ -256,7 +256,13 @@ near-instant.
 
 This tool compares structural demand on every steel member between the **existing** and **modified** models to check compliance with **IBC Section 3403**, which governs force increases in members of existing buildings being modified or repurposed.
 
-For each matched member the tool finds the **worst-case force across all ETABS design load combinations and stations**, then computes the percent change in magnitude as (abs(new) - abs(exist)) / abs(exist) x 100. Using absolute values ensures a sign reversal (tension flipping to compression) does not artificially inflate the percentage. Sign reversals are flagged separately in the Sign Rev. column.
+**Member matching** is performed by Story + Label (the ETABS frame label). Members present in only one model are shown as ADDED or REMOVED — no threshold check is applied to them.
+
+For each matched member the tool finds the **worst-case force across all ETABS design load combinations and stations**, then computes the percent change as (abs(new) − abs(exist)) / abs(exist) × 100. Using absolute values ensures a sign reversal (tension flipping to compression) does not artificially inflate the percentage. Sign reversals are flagged separately in the Sign Rev. column.
+
+**INF** in a % change column means the existing model force was effectively zero (< 0.01) while the new model has a non-zero force — the ratio is mathematically infinite. This most often indicates a newly loaded member. INF alone does not necessarily require a response; evaluate the absolute magnitude.
+
+**Net Demand** (UP / DOWN / MIXED) summarizes whether the governing forces increased, decreased, or split direction across the member. DOWN members are hidden from the typed tabs by default since they represent reduced demand.
 """)
 
     step2.section_about.intro_columns = vkt.Text("""
@@ -299,60 +305,68 @@ Start with the **Braces**, **Columns**, or **Beams** tab for focused review. Eac
 """)
 
     step2.section_options = vkt.Section('Comparison Options')
+
+    step2.section_options.lbl_design = vkt.Text('**Design Mode — IBC 3403 Thresholds**')
     step2.section_options.gravity_threshold = vkt.NumberField(
-        'Gravity Load Threshold — Design mode (%)',
+        'Gravity Load Threshold (%)',
         default=5,
         min=0,
         description='Maximum allowable % increase for gravity combos (IBC 3403)',
     )
     step2.section_options.lateral_threshold = vkt.NumberField(
-        'Lateral Load Threshold — Design mode (%)',
+        'Lateral Load Threshold (%)',
         default=10,
         min=0,
         description='Maximum allowable % increase for lateral combos (IBC 3403)',
     )
+
+    step2.section_options.lbl_analysis = vkt.Text('**Analysis Mode — Flag Thresholds**')
     step2.section_options.warn_threshold = vkt.NumberField(
-        'Warn Threshold — Analysis mode (%)',
+        'Warn Threshold (%)',
         default=5,
         min=0,
         description='Force increase above this triggers WARN',
     )
     step2.section_options.fail_threshold = vkt.NumberField(
-        'Flag Threshold — Analysis mode (%)',
+        'Flag Threshold (%)',
         default=10,
         min=0,
         description='Force increase above this triggers FLAG',
     )
+
+    step2.section_options.lbl_abs = vkt.Text('**Absolute Force Minimums — Typed Tabs**')
     step2.section_options.thresh_P = vkt.NumberField(
         'Min |P| to show (kips)',
         default=5.0,
         min=0,
-        description='Members are excluded from Braces/Columns tabs if |P| stays below this in both models.',
+        description='Members excluded from Braces/Columns tabs if |P| stays below this in both models.',
     )
     step2.section_options.thresh_M3 = vkt.NumberField(
         'Min |M3| to show (kip-ft)',
         default=20.0,
         min=0,
-        description='Members are excluded from Beams/Columns tabs if |M3| stays below this in both models.',
+        description='Members excluded from Beams/Columns tabs if |M3| stays below this in both models.',
     )
     step2.section_options.thresh_M2 = vkt.NumberField(
         'Min |M2| to show (kip-ft)',
         default=10.0,
         min=0,
-        description='Members are excluded from Columns tabs if |M2| stays below this in both models.',
+        description='Members excluded from Columns tabs if |M2| stays below this in both models.',
     )
     step2.section_options.thresh_V2 = vkt.NumberField(
         'Min |V2| to show (kips)',
         default=5.0,
         min=0,
-        description='Members are excluded from Beams tabs if |V2| stays below this in both models.',
+        description='Members excluded from Beams tabs if |V2| stays below this in both models.',
     )
     step2.section_options.thresh_V3 = vkt.NumberField(
         'Min |V3| to show (kips)',
         default=0.0,
         min=0,
-        description='Members are excluded from Columns tabs if |V3| stays below this in both models. Set to 0 to disable.',
+        description='Members excluded from Columns tabs if |V3| stays below this. Set to 0 to disable.',
     )
+
+    step2.section_options.lbl_display = vkt.Text('**Display Options**')
     step2.section_options.hide_decreases = vkt.BooleanField(
         'Hide members where demand decreased',
         default=True,
@@ -367,12 +381,16 @@ Start with the **Braces**, **Columns**, or **Beams** tab for focused review. Eac
         description='When checked, members that exist only in one model appear in the typed tabs.',
     )
     step2.section_options.display_filter = vkt.OptionField(
-        'Display Filter',
+        'Display Filter — Overview / Full Detail tabs',
         options=['All Results', 'Failures Only'],
         default='Failures Only',
     )
 
     step2.section_export = vkt.Section('Export')
+    step2.section_export.project_name = vkt.TextField(
+        'Project Name (optional)',
+        description='Included in the CSV filename, e.g. "BuildingA" → etabs_BuildingA_columns.csv',
+    )
     step2.section_export.member_type_export = vkt.OptionField(
         'Export Member Type',
         options=['All', 'Columns', 'Beams', 'Braces'],
@@ -387,7 +405,7 @@ Start with the **Braces**, **Columns**, or **Beams** tab for focused review. Eac
 
     step2.section_ai = vkt.Section('AI Assistant')
     step2.section_ai.chat = vkt.Chat(
-        'Ask about failures',
+        'Ask the Structural Assistant',
         method='call_llm',
         first_message=(
             'I can see the comparison results for this model. '
@@ -679,9 +697,13 @@ class Controller(vkt.Controller):
                     r.get('Story', ''),
                     r.get('Label', ''),
                     r.get('MemberType', ''),
+                    r.get('P_New', ''),
                     _fmt_pct(r.get('P_Pct', '')),
+                    r.get('V2_New', ''),
                     _fmt_pct(r.get('V2_Pct', '')),
+                    r.get('M2_New', ''),
                     _fmt_pct(r.get('M2_Pct', '')),
+                    r.get('M3_New', ''),
                     _fmt_pct(r.get('M3_Pct', '')),
                     _fmt_pct(r.get('WorstPct', '')),
                     r.get('FailReason', ''),
@@ -699,9 +721,9 @@ class Controller(vkt.Controller):
                 r.get('Story', ''),
                 r.get('Label', ''),
                 r.get('MemberType', ''),
+                r.get('LoadType', ''),
                 r.get('DesignSection_Exist', ''),
                 r.get('DesignSection_New', ''),
-                r.get('LoadType', ''),
                 r.get('PMM_Exist', ''),
                 r.get('PMM_New', ''),
                 _fmt_pct(r.get('PMM_Pct', '')),
@@ -824,7 +846,11 @@ class Controller(vkt.Controller):
 
         fig.update_layout(
             barmode='stack',
-            title='Members by Story and Status (highest story at top)',
+            title={
+                'text': 'Members by Story and Status (highest story at top)'
+                        '<br><sup style="font-size:11px;color:#777">All members shown — independent of display filter</sup>',
+                'x': 0.5, 'xanchor': 'center',
+            },
             height=max(420, 28 * len(stories) + 120),
             legend=dict(orientation='h', yanchor='bottom', y=1.05,
                         xanchor='right', x=1),
@@ -835,7 +861,7 @@ class Controller(vkt.Controller):
 
     # -- Summary table -------------------------------------------------------
 
-    @vkt.TableView('Summary by Story', duration_guess=2)
+    @vkt.TableView('By Story', duration_guess=2)
     def summary_table(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
@@ -875,7 +901,7 @@ class Controller(vkt.Controller):
 
     # -- Key metrics DataView ------------------------------------------------
 
-    @vkt.DataView('Key Metrics', duration_guess=2)
+    @vkt.DataView('Summary', duration_guess=2)
     def key_metrics(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
@@ -928,7 +954,8 @@ class Controller(vkt.Controller):
                              status_message='Members exceeding flag threshold — review required' if n_fail > 0 else 'All members within threshold'),
                 vkt.DataItem('Failure Rate', fail_rate, suffix='%', number_of_decimals=1, status=rate_status),
                 vkt.DataItem('Warnings', n_warn,
-                             status=vkt.DataStatus.WARNING if n_warn > 0 else vkt.DataStatus.SUCCESS),
+                             status=vkt.DataStatus.WARNING if n_warn > 0 else vkt.DataStatus.SUCCESS,
+                             status_message='Threshold exceeded but forces are small or demand decreased — review, likely acceptable' if n_warn > 0 else 'No warnings'),
                 vkt.DataItem('Added Members', len(added)),
                 vkt.DataItem('Removed Members', len(removed)),
                 vkt.DataItem('Worst Force Change', worst_force_pct if worst_force_pct is not None else 0.0,
@@ -937,6 +964,11 @@ class Controller(vkt.Controller):
                 vkt.DataItem('Most Affected Story', top_story, explanation_label=f'{top_count} failures'),
             )
         else:
+            p = params.step2.section_options
+            grav_thresh = float(p.gravity_threshold or 5)
+            lat_thresh  = float(p.lateral_threshold or 10)
+            pmm_flag_thresh = max(grav_thresh, lat_thresh)
+
             worst_pmm_pct = None
             worst_pmm_label = ''
             for r in all_results:
@@ -945,30 +977,40 @@ class Controller(vkt.Controller):
                     worst_pmm_pct  = pct
                     worst_pmm_label = f"{r.get('Story')} / {r.get('Label')}"
             pmm_status = (
-                vkt.DataStatus.ERROR   if (worst_pmm_pct or 0) > 10 else
-                vkt.DataStatus.WARNING if (worst_pmm_pct or 0) > 0  else
+                vkt.DataStatus.ERROR   if (worst_pmm_pct or 0) > pmm_flag_thresh else
+                vkt.DataStatus.WARNING if (worst_pmm_pct or 0) > 0               else
                 vkt.DataStatus.INFO
             )
+
+            grav_flags = [r for r in failures if r.get('LoadType') == 'gravity']
+            lat_flags  = [r for r in failures if r.get('LoadType') == 'lateral']
+
             data = vkt.DataGroup(
                 vkt.DataItem('Total Members Compared', total),
                 vkt.DataItem('Flagged', n_fail, status=fail_status,
-                             status_message='Members exceeding IBC 3403 thresholds — use judgment' if n_fail > 0 else 'All members within threshold'),
-                vkt.DataItem('Failure Rate', fail_rate, suffix='%', number_of_decimals=1, status=rate_status),
+                             status_message='Members exceeding IBC 3403 thresholds — use engineering judgment' if n_fail > 0 else 'All members within threshold'),
+                vkt.DataItem('  Gravity Flags', len(grav_flags),
+                             status=vkt.DataStatus.WARNING if grav_flags else vkt.DataStatus.SUCCESS,
+                             explanation_label=f'>{grav_thresh:.0f}% gravity combos'),
+                vkt.DataItem('  Lateral Flags', len(lat_flags),
+                             status=vkt.DataStatus.WARNING if lat_flags else vkt.DataStatus.SUCCESS,
+                             explanation_label=f'>{lat_thresh:.0f}% lateral combos'),
                 vkt.DataItem('Warnings', n_warn,
                              status=vkt.DataStatus.WARNING if n_warn > 0 else vkt.DataStatus.SUCCESS,
-                             status_message='Failed only on INF while primary forces decreased — review but likely acceptable' if n_warn > 0 else 'No warnings'),
+                             status_message='Threshold exceeded but demand reduced overall or member below capacity — review, likely acceptable' if n_warn > 0 else 'No warnings'),
                 vkt.DataItem('Added Members', len(added)),
                 vkt.DataItem('Removed Members', len(removed)),
+                vkt.DataItem('Failure Rate', fail_rate, suffix='%', number_of_decimals=1, status=rate_status),
                 vkt.DataItem('Worst PMM Change', worst_pmm_pct if worst_pmm_pct is not None else 0.0,
                              suffix='%', number_of_decimals=1, status=pmm_status,
                              explanation_label=worst_pmm_label),
-                vkt.DataItem('Most Affected Story', top_story, explanation_label=f'{top_count} failures'),
+                vkt.DataItem('Most Affected Story', top_story, explanation_label=f'{top_count} flags'),
             )
         return vkt.DataResult(data)
 
     # -- Beam detail HTML view -----------------------------------------------
 
-    @vkt.WebView('Beam Detail', duration_guess=2)
+    @vkt.WebView('Worst Beam (Design)', duration_guess=2)
     def beam_detail_view(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
@@ -1191,8 +1233,15 @@ class Controller(vkt.Controller):
         if export_type != 'All':
             singular = _TYPE_SINGULAR[export_type]
             results = [r for r in results if r.get('MemberType') == singular]
-        suffix = f'_{export_type.lower()}' if export_type != 'All' else ''
-        return vkt.DownloadResult(results_to_csv(results), f'etabs_comparison{suffix}.csv')
+        project = (params.step2.section_export.project_name or '').strip()
+        project_slug = re.sub(r'[^\w-]', '_', project) if project else ''
+        name_parts = ['etabs']
+        if project_slug:
+            name_parts.append(project_slug)
+        if export_type != 'All':
+            name_parts.append(export_type.lower())
+        filename = '_'.join(name_parts) + '.csv'
+        return vkt.DownloadResult(results_to_csv(results), filename)
 
     # -- LLM chat ------------------------------------------------------------
 
@@ -1202,41 +1251,95 @@ class Controller(vkt.Controller):
         if not conversation:
             return None
 
-        p = params.step2.section_options
-        gravity_thresh  = float(p.gravity_threshold or 5)
-        lateral_thresh  = float(p.lateral_threshold or 10)
-        all_results     = self._run_all(params)
-        failures        = [r for r in all_results if r.get('Pass') in ('FLAG', 'WARN')]
+        mode = params.step1.mode or 'Design Results'
+        p    = params.step2.section_options
 
-        failure_lines = []
-        for r in failures[:60]:
-            sect_change = (
-                f"{r.get('DesignSection_Exist')} → {r.get('DesignSection_New')}"
-                if r.get('DesignSection_Exist') != r.get('DesignSection_New')
-                else r.get('DesignSection_Exist', 'N/A')
+        def _severity(r):
+            pct = r.get('WorstPct')
+            if pct == 'INF':
+                return 999.0
+            return float(pct) if isinstance(pct, float) else -1.0
+
+        if mode == 'Analysis Results':
+            all_results = self._run_analysis_all(params)
+            flags       = sorted(
+                [r for r in all_results if r.get('Pass') == 'FLAG'],
+                key=_severity, reverse=True,
             )
-            status = r.get('Pass', 'FLAG')
-            failure_lines.append(
-                f"- [{status}] {r['MemberType']} {r['Label']} (Story {r['Story']}): "
-                f"{r.get('FailReason', 'N/A')} | net demand: {r.get('NetDemand', 'N/A')} | "
-                f"load type: {r.get('LoadType', 'N/A')} | section: {sect_change} | "
-                f"PMM: {r.get('PMM_Exist', 'N/A')} → {r.get('PMM_New', 'N/A')}"
+            warns       = [r for r in all_results if r.get('Pass') == 'WARN']
+            added       = [r for r in all_results if r.get('Pass') == 'ADDED']
+            removed     = [r for r in all_results if r.get('Pass') == 'REMOVED']
+            top60       = (flags + warns)[:60]
+            fail_threshold = float(p.fail_threshold or 10)
+            warn_threshold = float(p.warn_threshold or 5)
+            failure_lines = []
+            for r in top60:
+                status = r.get('Pass', '')
+                failure_lines.append(
+                    f"- [{status}] {r.get('MemberType')} {r.get('Label')} (Story {r.get('Story')}): "
+                    f"{r.get('FailReason', 'N/A')} | worst: {r.get('WorstPct', 'N/A')}% | "
+                    f"P: {r.get('P_Exist', 'N/A')} → {r.get('P_New', 'N/A')} | "
+                    f"M3: {r.get('M3_Exist', 'N/A')} → {r.get('M3_New', 'N/A')} | "
+                    f"combo (new): {r.get('GovCombo_New', 'N/A')}"
+                )
+            failure_block = "\n".join(failure_lines) if failure_lines else "None — all members within threshold."
+            system_prompt = (
+                f"You are a structural engineering assistant reviewing an ETABS element force comparison.\n\n"
+                f"Mode: Analysis Results. Thresholds: WARN >{warn_threshold}%, FLAG >{fail_threshold}%.\n"
+                f"Total members: {len(all_results)}. Flags: {len(flags)}. Warnings: {len(warns)}. "
+                f"Added: {len(added)}. Removed: {len(removed)}.\n\n"
+                f"WARN means the threshold was exceeded but forces are small or demand decreased overall — "
+                f"review advised but likely acceptable without remediation.\n\n"
+                f"Flagged / warned members (sorted by severity):\n{failure_block}\n\n"
+                f"Each line shows: status, member type, label, story, fail reason, worst % change, "
+                f"P and M3 existing→modified, governing combo in modified model.\n\n"
+                f"Answer concisely in engineering terms. Reference specific members and stories. "
+                f"If asked about a member not listed, note it is passing."
             )
-
-        failure_block = "\n".join(failure_lines) if failure_lines else "None — all members are passing."
-
-        system_prompt = (
-            f"You are a structural engineering assistant reviewing an ETABS model comparison "
-            f"for IBC Section 3403 compliance. The tool compares steel member demands between "
-            f"an existing building and a proposed modified model.\n\n"
-            f"Thresholds in use: gravity combos {gravity_thresh}%, lateral combos {lateral_thresh}%.\n"
-            f"Total members compared: {len(all_results)}. Failures: {len(failures)}.\n\n"
-            f"Failing members:\n{failure_block}\n\n"
-            f"Each failure line shows: member type, label, story, fail reason (which force/ratio "
-            f"exceeded the threshold and by how much), load type, section change, and PMM ratio change.\n\n"
-            f"Answer concisely in engineering terms. Reference specific members and stories. "
-            f"If asked about a member not in the failure list, note that it is passing."
-        )
+        else:
+            gravity_thresh = float(p.gravity_threshold or 5)
+            lateral_thresh = float(p.lateral_threshold or 10)
+            all_results    = self._run_all(params)
+            flags          = sorted(
+                [r for r in all_results if r.get('Pass') == 'FLAG'],
+                key=_severity, reverse=True,
+            )
+            warns   = [r for r in all_results if r.get('Pass') == 'WARN']
+            added   = [r for r in all_results if r.get('Pass') == 'ADDED']
+            removed = [r for r in all_results if r.get('Pass') == 'REMOVED']
+            top60   = (flags + warns)[:60]
+            failure_lines = []
+            for r in top60:
+                sect_change = (
+                    f"{r.get('DesignSection_Exist')} → {r.get('DesignSection_New')}"
+                    if r.get('DesignSection_Exist') != r.get('DesignSection_New')
+                    else r.get('DesignSection_Exist', 'N/A')
+                )
+                sign_rev = r.get('SignReversal', '')
+                sign_note = f' | sign rev: {sign_rev}' if sign_rev else ''
+                status = r.get('Pass', '')
+                failure_lines.append(
+                    f"- [{status}] {r.get('MemberType')} {r.get('Label')} (Story {r.get('Story')}): "
+                    f"{r.get('FailReason', 'N/A')} | net demand: {r.get('NetDemand', 'N/A')} | "
+                    f"load type: {r.get('LoadType', 'N/A')} | section: {sect_change} | "
+                    f"PMM: {r.get('PMM_Exist', 'N/A')} → {r.get('PMM_New', 'N/A')}{sign_note}"
+                )
+            failure_block = "\n".join(failure_lines) if failure_lines else "None — all members are passing."
+            system_prompt = (
+                f"You are a structural engineering assistant reviewing an ETABS model comparison "
+                f"for IBC Section 3403 compliance. The tool compares steel member demands between "
+                f"an existing building and a proposed modified model.\n\n"
+                f"Mode: Design Results. Thresholds: gravity {gravity_thresh}%, lateral {lateral_thresh}%.\n"
+                f"Total members: {len(all_results)}. Flags: {len(flags)}. Warnings: {len(warns)}. "
+                f"Added: {len(added)}. Removed: {len(removed)}.\n\n"
+                f"WARN means the FLAG threshold was exceeded, but the modified model PMM D/C ratio is "
+                f"still below 0.95 or all forces decreased — threshold tripped but member is not overstressed.\n\n"
+                f"Flagged / warned members (sorted by severity):\n{failure_block}\n\n"
+                f"Each line: status, member type, label, story, fail reason, net demand direction, "
+                f"load type, section change, PMM ratio change, sign reversal if any.\n\n"
+                f"Answer concisely in engineering terms. Reference specific members and stories. "
+                f"If asked about a member not listed, note it is passing."
+            )
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -1256,7 +1359,7 @@ class Controller(vkt.Controller):
             )
             return vkt.ChatResult(conversation, text_stream)
         except openai.RateLimitError:
-            raise vkt.UserError("LLM rate limit reached — please wait a moment and try again.")
+            raise vkt.UserError('AI rate limit reached — wait a moment and try again.')
 
     # -- Shared helpers ------------------------------------------------------
 
