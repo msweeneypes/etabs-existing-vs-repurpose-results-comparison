@@ -11,7 +11,7 @@ _llm_client = OpenAI(
 
 from comparison import (
     build_summary, results_to_csv, run_comparison, FORCE_COMPONENTS,
-    DESIGN_FORCES_SHEETS, _get_parsed_file,
+    GOVERNING_FORCES, DESIGN_FORCES_SHEETS, _get_parsed_file,
 )
 from analysis_comparison import (
     run_analysis_comparison, ANALYSIS_FORCES_SHEETS, _get_parsed_analysis_file,
@@ -23,14 +23,12 @@ from storage_cache import get_cached, set_cached
 # ---------------------------------------------------------------------------
 
 OVERVIEW_HEADERS = [
-    'Story', 'Label', 'Type',
-    'Load Type',
-    'Section (Exist)', 'Section (New)',
-    'PMM (Exist)', 'PMM (New)', 'PMM (%)',
-    'V Major D/C',
-    'Worst Force (%)',
-    'Flag Reason',
-    'Result',
+    'Story', 'Label', 'Type', 'Load Type',
+    'P (New)', 'P (%)',
+    'V2 (New)', 'V2 (%)',
+    'M3 (New)', 'M3 (%)',
+    'M2 (New)', 'M2 (%)',
+    'Worst (%)', 'Flag Reason', 'Result',
 ]
 
 DETAIL_HEADERS = [
@@ -75,11 +73,6 @@ _RESULT_COLORS = {
 
 # Member type helpers for typed tabs
 _TYPE_SINGULAR = {'Columns': 'Column', 'Beams': 'Beam', 'Braces': 'Brace'}
-_GOVERNING_FORCES_BY_TYPE = {
-    'Columns': ['P', 'M3', 'M2'],
-    'Beams':   ['M3', 'V2'],
-    'Braces':  ['P'],
-}
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +112,7 @@ def _net_demand(r: dict) -> str:
         return 'N/A'
     pcts = [
         r.get('P_Pct'), r.get('V2_Pct'), r.get('V3_Pct'),
-        r.get('M2_Pct'), r.get('M3_Pct'), r.get('PMM_Pct'),
+        r.get('M2_Pct'), r.get('M3_Pct'),
     ]
     numeric = [p for p in pcts if isinstance(p, float)]
     if not numeric:
@@ -131,33 +124,21 @@ def _net_demand(r: dict) -> str:
     return 'MIXED'
 
 
-_CAPACITY_WARN_THRESHOLD = 0.95  # PMM below this + FLAG → WARN (member still under capacity)
-
-
 def _postprocess_results(results: list) -> list:
-    """Add NetDemand; downgrade FLAG → WARN for two conditions:
-    1. All numeric forces decreased (INF-only failure on previously-zero component).
-    2. Threshold exceeded but modified PMM D/C ratio is still < 0.95 (below capacity).
-    """
+    """Add NetDemand to each result row. WARN/FLAG status is set at comparison time."""
     out = []
     for r in results:
         r = dict(r)
-        nd = _net_demand(r)
-        r['NetDemand'] = nd
-        if r.get('Pass') == 'FLAG':
-            pmm_new = r.get('PMM_New')
-            forces_down = nd == 'DOWN'
-            below_capacity = isinstance(pmm_new, float) and pmm_new < _CAPACITY_WARN_THRESHOLD
-            if forces_down or below_capacity:
-                r['Pass'] = 'WARN'
+        r['NetDemand'] = _net_demand(r)
         out.append(r)
     return out
 
 
 def _recompute_typed_fail_reason(
     r: dict, gov_forces: list, force_thresholds: dict,
-    grav_thresh: float, lat_thresh: float,
-    warn_thresh: float, fail_thresh: float,
+    grav_warn: float, grav_fail: float,
+    lat_warn: float, lat_fail: float,
+    analysis_warn: float, analysis_fail: float,
     is_analysis: bool, status: str,
 ) -> dict:
     """Return a copy of r with FailReason restricted to gov_forces above their abs threshold.
@@ -166,12 +147,9 @@ def _recompute_typed_fail_reason(
     (e.g. M2 for beams) from appearing as the primary flag reason in the typed tabs.
     """
     if is_analysis:
-        pct_threshold = fail_thresh if status == 'FLAG' else warn_thresh
-        load_type = None
+        pct_threshold = analysis_fail if status == 'FLAG' else analysis_warn
         sign_tag = ''
     else:
-        load_type = r.get('LoadType', 'gravity')
-        pct_threshold = lat_thresh if load_type == 'lateral' else grav_thresh
         sign_tag = ' [sign rev]' if r.get('SignReversal') == 'YES' else ''
 
     def _max_abs(f):
@@ -180,34 +158,54 @@ def _recompute_typed_fail_reason(
             default=0.0,
         )
 
+    def _force_thresh(f: str) -> float:
+        if is_analysis:
+            return pct_threshold
+        f_lt = r.get(f'{f}_LoadType', r.get('LoadType', 'gravity'))
+        return (lat_fail if f_lt == 'lateral' else grav_fail) if status == 'FLAG' else (lat_warn if f_lt == 'lateral' else grav_warn)
+
     # Priority 1: INF change on a gov force above its abs threshold
     for f in gov_forces:
         if r.get(f'{f}_Pct') == 'INF' and _max_abs(f) >= force_thresholds.get(f, 0.0):
-            new_reason = (
-                f'{f} INF > {pct_threshold:.0f}%' if is_analysis
-                else f'{f} INF ({load_type}){sign_tag}'
-            )
+            if is_analysis:
+                new_reason = f'{f} INF > {pct_threshold:.0f}%'
+            else:
+                f_lt = r.get(f'{f}_LoadType', r.get('LoadType', 'gravity'))
+                new_reason = f'{f} INF ({f_lt}){sign_tag}'
             return {**r, 'FailReason': new_reason}
 
-    # Priority 2: worst % exceeding pct_threshold on a gov force above its abs threshold
-    worst_label = None
-    worst_pct_val = 0.0
-    for f in gov_forces:
-        pct = r.get(f'{f}_Pct')
-        if not isinstance(pct, float) or pct <= pct_threshold:
-            continue
-        if _max_abs(f) >= force_thresholds.get(f, 0.0) and pct > worst_pct_val:
-            worst_pct_val = pct
-            worst_label = f
+    # Priority 2: worst % exceeding per-force threshold, grouped by load type for compound reasons
+    if is_analysis:
+        worst_label = None
+        worst_pct_val = 0.0
+        for f in gov_forces:
+            pct = r.get(f'{f}_Pct')
+            if not isinstance(pct, float):
+                continue
+            if pct > pct_threshold and _max_abs(f) >= force_thresholds.get(f, 0.0) and pct > worst_pct_val:
+                worst_pct_val = pct
+                worst_label = f
+        if worst_label is not None:
+            return {**r, 'FailReason': f'{worst_label} +{worst_pct_val:.1f}% > {pct_threshold:.0f}%'}
+    else:
+        # Collect worst qualifying force per load type
+        worst_by_lt: dict = {}  # load_type → (force, pct_val)
+        for f in gov_forces:
+            pct = r.get(f'{f}_Pct')
+            if not isinstance(pct, float):
+                continue
+            f_thresh = _force_thresh(f)
+            if pct > f_thresh and _max_abs(f) >= force_thresholds.get(f, 0.0):
+                f_lt = r.get(f'{f}_LoadType', r.get('LoadType', 'gravity'))
+                if f_lt not in worst_by_lt or pct > worst_by_lt[f_lt][1]:
+                    worst_by_lt[f_lt] = (f, pct)
+        if worst_by_lt:
+            parts = []
+            for lt in sorted(worst_by_lt, key=lambda x: (x != 'lateral')):
+                f, pv = worst_by_lt[lt]
+                parts.append(f'{f} +{pv:.1f}% > {_force_thresh(f):.0f}% {lt}')
+            return {**r, 'FailReason': ' | '.join(parts) + sign_tag}
 
-    if worst_label is not None:
-        new_reason = (
-            f'{worst_label} +{worst_pct_val:.1f}% > {pct_threshold:.0f}%' if is_analysis
-            else f'{worst_label} +{worst_pct_val:.1f}% > {pct_threshold:.0f}% {load_type}{sign_tag}'
-        )
-        return {**r, 'FailReason': new_reason}
-
-    # No qualifying force found among gov_forces above abs threshold
     return {**r, 'FailReason': ''}
 
 
@@ -352,16 +350,28 @@ Start with the **Braces**, **Columns**, or **Beams** tab for focused review. Eac
 
     step2.section_options.lbl_design = vkt.Text('**Design Mode — IBC 3403 Thresholds**')
     step2.section_options.gravity_threshold = vkt.NumberField(
-        'Gravity Load Threshold (%)',
+        'Gravity Flag Threshold (%)',
         default=5,
         min=0,
-        description='Maximum allowable % increase for gravity combos (IBC 3403)',
+        description='Governing force increase above this triggers FLAG for gravity combos (IBC 3403)',
+    )
+    step2.section_options.gravity_warn_threshold = vkt.NumberField(
+        'Gravity Warn Threshold (%)',
+        default=2.5,
+        min=0,
+        description='Governing force increase above this triggers WARN for gravity combos',
     )
     step2.section_options.lateral_threshold = vkt.NumberField(
-        'Lateral Load Threshold (%)',
+        'Lateral Flag Threshold (%)',
         default=10,
         min=0,
-        description='Maximum allowable % increase for lateral combos (IBC 3403)',
+        description='Governing force increase above this triggers FLAG for lateral combos (IBC 3403)',
+    )
+    step2.section_options.lateral_warn_threshold = vkt.NumberField(
+        'Lateral Warn Threshold (%)',
+        default=5,
+        min=0,
+        description='Governing force increase above this triggers WARN for lateral combos',
     )
 
     step2.section_options.lbl_analysis = vkt.Text('**Analysis Mode — Flag Thresholds**')
@@ -568,6 +578,8 @@ def _render_member_detail_html(
     lateral_thresh: float,
     mode: str,
     subtitle: Optional[str] = None,
+    gravity_warn_thresh: Optional[float] = None,
+    lateral_warn_thresh: Optional[float] = None,
 ) -> str:
     if member is None:
         return (
@@ -577,8 +589,17 @@ def _render_member_detail_html(
 
     is_analysis = (mode == 'Analysis Results')
     load_type   = member.get('LoadType', 'gravity') if not is_analysis else None
-    threshold   = (lateral_thresh if load_type == 'lateral' else gravity_thresh) if not is_analysis else gravity_thresh
     pass_val    = member.get('Pass', '')
+
+    if is_analysis:
+        # gravity_thresh holds fail threshold; lateral_warn_thresh repurposed as analysis warn threshold
+        threshold = (lateral_warn_thresh if lateral_warn_thresh is not None else gravity_thresh) if pass_val == 'WARN' else gravity_thresh
+    elif pass_val == 'WARN':
+        gw = gravity_warn_thresh if gravity_warn_thresh is not None else gravity_thresh
+        lw = lateral_warn_thresh if lateral_warn_thresh is not None else lateral_thresh
+        threshold = lw if load_type == 'lateral' else gw
+    else:
+        threshold = lateral_thresh if load_type == 'lateral' else gravity_thresh
     label       = member.get('Label', '')
     story       = member.get('Story', '')
     mtype       = member.get('MemberType', '')
@@ -809,12 +830,14 @@ class Controller(vkt.Controller):
                 r.get('Label', ''),
                 r.get('MemberType', ''),
                 r.get('LoadType', ''),
-                r.get('DesignSection_Exist', ''),
-                r.get('DesignSection_New', ''),
-                r.get('PMM_Exist', ''),
-                r.get('PMM_New', ''),
-                _fmt_pct(r.get('PMM_Pct', '')),
-                _fmt_pct(r.get('VMaj_Pct', '')),
+                r.get('P_New', ''),
+                _fmt_pct(r.get('P_Pct', '')),
+                r.get('V2_New', ''),
+                _fmt_pct(r.get('V2_Pct', '')),
+                r.get('M3_New', ''),
+                _fmt_pct(r.get('M3_Pct', '')),
+                r.get('M2_New', ''),
+                _fmt_pct(r.get('M2_Pct', '')),
                 _worst_force_pct(r),
                 r.get('FailReason', ''),
                 _result_cell(r.get('Pass', '')),
@@ -983,8 +1006,6 @@ class Controller(vkt.Controller):
             p = params.step2.section_options
             grav_thresh = float(p.gravity_threshold or 5)
             lat_thresh  = float(p.lateral_threshold or 10)
-            pmm_flag_thresh = max(grav_thresh, lat_thresh)
-
             worst_pmm_pct = None
             worst_pmm_label = ''
             for r in all_results:
@@ -992,11 +1013,7 @@ class Controller(vkt.Controller):
                 if isinstance(pct, float) and (worst_pmm_pct is None or pct > worst_pmm_pct):
                     worst_pmm_pct  = pct
                     worst_pmm_label = f"{r.get('Story')} / {r.get('Label')}"
-            pmm_status = (
-                vkt.DataStatus.ERROR   if (worst_pmm_pct or 0) > pmm_flag_thresh else
-                vkt.DataStatus.WARNING if (worst_pmm_pct or 0) > 0               else
-                vkt.DataStatus.INFO
-            )
+            pmm_status = vkt.DataStatus.INFO
 
             grav_flags = [r for r in failures if r.get('LoadType') == 'gravity']
             lat_flags  = [r for r in failures if r.get('LoadType') == 'lateral']
@@ -1013,7 +1030,7 @@ class Controller(vkt.Controller):
                              explanation_label=f'>{lat_thresh:.0f}% lateral combos'),
                 vkt.DataItem('Warnings', n_warn,
                              status=vkt.DataStatus.WARNING if n_warn > 0 else vkt.DataStatus.SUCCESS,
-                             status_message='Threshold exceeded but demand reduced overall or member below capacity — review, likely acceptable' if n_warn > 0 else 'No warnings'),
+                             status_message='Governing force exceeded warn threshold but not flag threshold — increase is notable, review advised' if n_warn > 0 else 'No warnings'),
                 vkt.DataItem('Added Members', len(added)),
                 vkt.DataItem('Removed Members', len(removed)),
                 vkt.DataItem('Failure Rate', fail_rate, suffix='%', number_of_decimals=1, status=rate_status),
@@ -1033,16 +1050,26 @@ class Controller(vkt.Controller):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
 
-        mode           = params.step1.mode or 'Design Results'
-        p              = params.step2.section_options
-        d              = params.step2.section_detail
-        gravity_thresh = float(p.gravity_threshold or 5)
-        lateral_thresh = float(p.lateral_threshold or 10)
+        mode = params.step1.mode or 'Design Results'
+        p    = params.step2.section_options
+        d    = params.step2.section_detail
+        is_analysis = (mode == 'Analysis Results')
+
+        if is_analysis:
+            gravity_thresh      = float(p.fail_threshold or 10)
+            lateral_thresh      = float(p.fail_threshold or 10)
+            gravity_warn_thresh = float(p.warn_threshold or 5)
+            lateral_warn_thresh = float(p.warn_threshold or 5)
+        else:
+            gravity_thresh      = float(p.gravity_threshold      or 5)
+            lateral_thresh      = float(p.lateral_threshold      or 10)
+            gravity_warn_thresh = float(p.gravity_warn_threshold or 2.5)
+            lateral_warn_thresh = float(p.lateral_warn_threshold or 5)
 
         search_label = (d.detail_label or '').strip()
         search_story = (d.detail_story or '').strip().lower()
 
-        all_results = self._run_analysis_all(params) if mode == 'Analysis Results' else self._run_all(params)
+        all_results = self._run_analysis_all(params) if is_analysis else self._run_all(params)
 
         if search_label:
             candidates = [
@@ -1054,15 +1081,17 @@ class Controller(vkt.Controller):
             member = next((r for r in candidates if r.get('Pass') == 'FLAG'), candidates[0] if candidates else None)
             subtitle = None
         else:
-            # No label entered — default to worst flagged member
-            if mode == 'Analysis Results':
+            if is_analysis:
                 member = self._find_worst_member(all_results)
                 subtitle = 'Worst flagged member auto-selected — enter a label above to view any member'
             else:
                 member = self._find_worst_beam(all_results)
                 subtitle = 'Worst flagged beam auto-selected — enter a label above to view any member'
 
-        html = _render_member_detail_html(member, gravity_thresh, lateral_thresh, mode, subtitle=subtitle)
+        html = _render_member_detail_html(
+            member, gravity_thresh, lateral_thresh, mode, subtitle=subtitle,
+            gravity_warn_thresh=gravity_warn_thresh, lateral_warn_thresh=lateral_warn_thresh,
+        )
         return vkt.WebResult(html=html)
 
     # -- Typed member-class tabs -----------------------------------------------
@@ -1100,7 +1129,6 @@ class Controller(vkt.Controller):
                 'Story', 'Label', 'Section (Exist)', 'Section (New)',
                 'Combo (Exist)', 'Combo (New)', 'Load Type',
                 'P (Exist)', 'P (New)', 'P (%)',
-                'PMM (Exist)', 'PMM (New)', 'PMM (%)',
                 'Flag Reason', 'Result',
             ]
             data = []
@@ -1112,8 +1140,6 @@ class Controller(vkt.Controller):
                     r.get('LoadType', ''),
                     r.get('P_Exist', ''), r.get('P_New', ''),
                     _fmt_pct(r.get('P_Pct', '')),
-                    r.get('PMM_Exist', ''), r.get('PMM_New', ''),
-                    _fmt_pct(r.get('PMM_Pct', '')),
                     r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
                 ])
         return vkt.TableResult(data, column_headers=headers)
@@ -1159,7 +1185,6 @@ class Controller(vkt.Controller):
                 'P (Exist)', 'P (New)', 'P (%)',
                 'M3 (Exist)', 'M3 (New)', 'M3 (%)',
                 'M2 (Exist)', 'M2 (New)', 'M2 (%)',
-                'PMM (Exist)', 'PMM (New)', 'PMM (%)',
                 'Flag Reason', 'Result',
             ]
             data = []
@@ -1175,8 +1200,6 @@ class Controller(vkt.Controller):
                     _fmt_pct(r.get('M3_Pct', '')),
                     r.get('M2_Exist', ''), r.get('M2_New', ''),
                     _fmt_pct(r.get('M2_Pct', '')),
-                    r.get('PMM_Exist', ''), r.get('PMM_New', ''),
-                    _fmt_pct(r.get('PMM_Pct', '')),
                     r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
                 ])
         return vkt.TableResult(data, column_headers=headers)
@@ -1218,7 +1241,6 @@ class Controller(vkt.Controller):
                 'Combo (Exist)', 'Combo (New)', 'Load Type',
                 'M3 (Exist)', 'M3 (New)', 'M3 (%)',
                 'V2 (Exist)', 'V2 (New)', 'V2 (%)',
-                'PMM (Exist)', 'PMM (New)', 'PMM (%)',
                 'Flag Reason', 'Result',
             ]
             data = []
@@ -1232,8 +1254,6 @@ class Controller(vkt.Controller):
                     _fmt_pct(r.get('M3_Pct', '')),
                     r.get('V2_Exist', ''), r.get('V2_New', ''),
                     _fmt_pct(r.get('V2_Pct', '')),
-                    r.get('PMM_Exist', ''), r.get('PMM_New', ''),
-                    _fmt_pct(r.get('PMM_Pct', '')),
                     r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
                 ])
         return vkt.TableResult(data, column_headers=headers)
@@ -1247,11 +1267,10 @@ class Controller(vkt.Controller):
             return None
 
         def score(r):
-            force_max = max(
+            return max(
                 (_numeric_pct(r.get(f'{c}_Pct', 0)) for c in FORCE_COMPONENTS),
                 default=0.0,
             )
-            return max(force_max, _numeric_pct(r.get('PMM_Pct', 0)))
 
         return max(pool, key=score)
 
@@ -1348,9 +1367,7 @@ class Controller(vkt.Controller):
                 f"If asked about a member not listed, note it is passing."
             )
         else:
-            gravity_thresh = float(p.gravity_threshold or 5)
-            lateral_thresh = float(p.lateral_threshold or 10)
-            all_results    = self._run_all(params)
+            all_results = self._run_all(params)
             flags          = sorted(
                 [r for r in all_results if r.get('Pass') == 'FLAG'],
                 key=_severity, reverse=True,
@@ -1374,30 +1391,35 @@ class Controller(vkt.Controller):
                     pct_str = f'+{pct:.1f}%' if isinstance(pct, float) else str(pct)
                     return f'{c}: {e}→{n} ({pct_str})'
                 forces_str = ' | '.join(_fc(c) for c in FORCE_COMPONENTS)
-                pmm_pct = r.get('PMM_Pct', 'N/A')
-                pmm_pct_str = f'+{pmm_pct:.1f}%' if isinstance(pmm_pct, float) else str(pmm_pct)
                 failure_lines.append(
                     f"- [{status}] {r.get('MemberType')} {r.get('Label')} (Story {r.get('Story')}): "
                     f"{r.get('FailReason', 'N/A')} | net demand: {r.get('NetDemand', 'N/A')} | "
                     f"load type: {r.get('LoadType', 'N/A')} | section: {sect_change} | "
-                    f"{forces_str} | "
-                    f"PMM: {r.get('PMM_Exist', 'N/A')}→{r.get('PMM_New', 'N/A')} ({pmm_pct_str})"
+                    f"gov combo (new): {r.get('GovCombo_New', 'N/A')} | "
+                    f"{forces_str}"
                     f"{sign_note}"
                 )
             failure_block = "\n".join(failure_lines) if failure_lines else "None — all members are passing."
+            p = params.step2.section_options
+            grav_fail_t = float(p.gravity_threshold or 5)
+            grav_warn_t = float(p.gravity_warn_threshold or 2.5)
+            lat_fail_t  = float(p.lateral_threshold or 10)
+            lat_warn_t  = float(p.lateral_warn_threshold or 5)
             system_prompt = (
                 f"You are a structural engineering assistant reviewing an ETABS model comparison "
                 f"for IBC Section 3403 compliance. The tool compares steel member demands between "
                 f"an existing building and a proposed modified model.\n\n"
-                f"Mode: Design Results. Thresholds: gravity {gravity_thresh}%, lateral {lateral_thresh}%.\n"
+                f"Mode: Design Results. Thresholds — gravity: WARN >{grav_warn_t}%, FLAG >{grav_fail_t}%; "
+                f"lateral: WARN >{lat_warn_t}%, FLAG >{lat_fail_t}%.\n"
+                f"Governing forces checked per type: Columns (P, M3, M2), Beams (M3, V2), Braces (P).\n"
                 f"Total members: {len(all_results)}. Flags: {len(flags)}. Warnings: {len(warns)}. "
                 f"Added: {len(added)}. Removed: {len(removed)}.\n\n"
-                f"WARN means the FLAG threshold was exceeded, but the modified model PMM D/C ratio is "
-                f"still below 0.95 or all forces decreased — threshold tripped but member is not overstressed.\n\n"
+                f"WARN means the warn threshold was exceeded by a governing force but the flag threshold "
+                f"was not — increase is notable but below the IBC 3403 trigger level.\n\n"
                 f"Flagged / warned members (sorted by severity):\n{failure_block}\n\n"
                 f"Each line: status, member type, label, story, fail reason, net demand direction, "
-                f"load type, section change, all force components (exist→modified, % change), "
-                f"PMM ratio change, sign reversal if any.\n\n"
+                f"load type, section change, governing combo in modified model, "
+                f"all force components (exist→modified, % change), sign reversal if any.\n\n"
                 f"Answer concisely in engineering terms. Reference specific members, stories, and force values. "
                 f"If asked about a member not listed, note it is passing."
             )
@@ -1428,7 +1450,7 @@ class Controller(vkt.Controller):
         """Filtered results (respects display_filter param). Delegates to _run_all."""
         results = self._run_all(params)
         if (params.step2.section_options.display_filter or 'Failures Only') == 'Failures Only':
-            return [r for r in results if r.get('Pass') == 'FLAG']
+            return [r for r in results if r.get('Pass') in ('FLAG', 'WARN')]
         return results
 
     def _run_all(self, params):
@@ -1437,18 +1459,20 @@ class Controller(vkt.Controller):
         Reduces cold-worker Storage reads from 3 (parse×2 + cmp) down to 1
         for every view after the first call with a given file+threshold combo.
         """
-        p    = params.step2.section_options
-        grav = float(p.gravity_threshold or 5)
-        lat  = float(p.lateral_threshold or 10)
-        ef   = params.step1.existing_file.file
-        nf   = params.step1.modified_file.file
+        p         = params.step2.section_options
+        grav      = float(p.gravity_threshold      or 5)
+        lat       = float(p.lateral_threshold      or 10)
+        grav_warn = float(p.gravity_warn_threshold or 2.5)
+        lat_warn  = float(p.lateral_warn_threshold or 5)
+        ef = params.step1.existing_file.file
+        nf = params.step1.modified_file.file
         # _get_parsed_file downloads + parses once and warms _MEMORY so
         # run_comparison's internal _get_parsed_file call is a free cache hit.
         eh, _ = _get_parsed_file(ef)
         nh, _ = _get_parsed_file(nf)
-        key  = (eh, nh, grav, lat)
+        key = (eh, nh, grav, lat, grav_warn, lat_warn)
 
-        cached = get_cached('etabs_post', key)
+        cached = get_cached('etabs_postv4', key)
         if cached is not None:
             return cached
 
@@ -1458,10 +1482,12 @@ class Controller(vkt.Controller):
             member_type_filter='All',
             gravity_threshold=grav,
             lateral_threshold=lat,
+            gravity_warn_threshold=grav_warn,
+            lateral_warn_threshold=lat_warn,
             show_failures_only=False,
         )
         processed = _postprocess_results(results)
-        set_cached('etabs_post', key, processed)
+        set_cached('etabs_postv4', key, processed)
         return processed
 
     def _run_analysis(self, params):
@@ -1483,7 +1509,7 @@ class Controller(vkt.Controller):
         nh, _ = _get_parsed_analysis_file(nf)
         key  = (eh, nh, warn, fail, 'analysis')
 
-        cached = get_cached('etabs_post', key)
+        cached = get_cached('etabs_postv4', key)
         if cached is not None:
             return cached
 
@@ -1495,7 +1521,7 @@ class Controller(vkt.Controller):
             fail_threshold=fail,
             show_failures_only=False,
         )
-        set_cached('etabs_post', key, results)
+        set_cached('etabs_postv4', key, results)
         return results
 
     def _run_typed(self, params, member_type: str) -> list:
@@ -1514,8 +1540,10 @@ class Controller(vkt.Controller):
             'V2': float(p.thresh_V2 if p.thresh_V2 is not None else 5.0),
             'V3': float(p.thresh_V3 if p.thresh_V3 is not None else 0.0),
         }
-        grav_thresh  = float(p.gravity_threshold or 5)
-        lat_thresh   = float(p.lateral_threshold or 10)
+        grav_fail    = float(p.gravity_threshold      or 5)
+        lat_fail     = float(p.lateral_threshold      or 10)
+        grav_warn    = float(p.gravity_warn_threshold or 2.5)
+        lat_warn     = float(p.lateral_warn_threshold or 5)
         warn_thresh  = float(p.warn_threshold or 5)
         fail_thresh  = float(p.fail_threshold or 10)
         hide_decreases     = p.hide_decreases if p.hide_decreases is not None else True
@@ -1529,7 +1557,7 @@ class Controller(vkt.Controller):
         )
 
         singular   = _TYPE_SINGULAR[member_type]
-        gov_forces = _GOVERNING_FORCES_BY_TYPE[member_type]
+        gov_forces = GOVERNING_FORCES[member_type]
 
         out = []
         for r in all_results:
@@ -1549,16 +1577,20 @@ class Controller(vkt.Controller):
             # For PASS: at least one governing force (either model) must be above its limit.
             if status not in ('ADDED', 'REMOVED'):
                 if status in ('FLAG', 'WARN'):
-                    if is_analysis:
-                        member_pct_thresh = fail_thresh if status == 'FLAG' else warn_thresh
-                    else:
-                        _lt = r.get('LoadType', 'gravity')
-                        member_pct_thresh = lat_thresh if _lt == 'lateral' else grav_thresh
                     any_meaningful = False
                     for f in gov_forces:
                         pct = r.get(f'{f}_Pct')
+                        # Per-force load type for design mode; single threshold for analysis
+                        if is_analysis:
+                            f_pct_thresh = fail_thresh if status == 'FLAG' else warn_thresh
+                        else:
+                            f_lt = r.get(f'{f}_LoadType', r.get('LoadType', 'gravity'))
+                            if status == 'FLAG':
+                                f_pct_thresh = lat_fail if f_lt == 'lateral' else grav_fail
+                            else:
+                                f_pct_thresh = lat_warn if f_lt == 'lateral' else grav_warn
                         # Must be flagging (INF or exceeds % threshold), not just increasing
-                        is_flagging = pct == 'INF' or (isinstance(pct, float) and pct > member_pct_thresh)
+                        is_flagging = pct == 'INF' or (isinstance(pct, float) and pct > f_pct_thresh)
                         if not is_flagging:
                             continue
                         limit = force_thresholds.get(f, 0.0)
@@ -1596,7 +1628,9 @@ class Controller(vkt.Controller):
             if status in ('FLAG', 'WARN'):
                 r = _recompute_typed_fail_reason(
                     r, gov_forces, force_thresholds,
-                    grav_thresh, lat_thresh, warn_thresh, fail_thresh,
+                    grav_warn, grav_fail,
+                    lat_warn, lat_fail,
+                    warn_thresh, fail_thresh,
                     is_analysis, status,
                 )
 

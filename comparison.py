@@ -20,6 +20,12 @@ from storage_cache import get_cached, set_cached
 
 FORCE_COMPONENTS = ['P', 'V2', 'V3', 'T', 'M2', 'M3']
 
+GOVERNING_FORCES = {
+    'Columns': ['P', 'M3', 'M2'],
+    'Beams':   ['M3', 'V2'],
+    'Braces':  ['P'],
+}
+
 DESIGN_FORCES_SHEETS = {
     'Columns': 'Design Forces - Columns',
     'Beams':   'Design Forces - Beams',
@@ -49,17 +55,12 @@ LATERAL_RE = re.compile(r'(?<![A-Za-z])([EW][A-Za-z]+)(?![A-Za-z])')
 
 
 # Caching is handled by storage_cache (two-level: in-process + Viktor Storage).
-# Prefixes: 'etabs_parse' for parsed workbook data, 'etabs_cmp' for comparison results.
+# Prefixes: 'etabs_parsev3' for parsed workbook data, 'etabs_cmpv4' for comparison results.
 
 
 # ---------------------------------------------------------------------------
 # Low-level helpers
 # ---------------------------------------------------------------------------
-
-def _file_hash(file_obj) -> str:
-    """Return MD5 hex digest of the file content."""
-    return hashlib.md5(file_obj.getvalue_binary()).hexdigest()
-
 
 def _stream_etabs_rows(ws):
     """
@@ -90,11 +91,13 @@ def _parse_forces_from_wb(wb, member_type: str) -> pd.DataFrame:
     Stream one Design Forces worksheet from an open workbook.
 
     Online max-abs aggregation: stores one float per (Story, Label, component).
+    Also tracks which OutputCase drove the max for each component ({c}_Combo).
     Peak memory is O(unique members), not O(rows), regardless of file size.
     """
     sheet_name    = DESIGN_FORCES_SHEETS[member_type]
     label_col_name = LABEL_COL[member_type]
-    empty = pd.DataFrame(columns=['Story', 'Label'] + FORCE_COMPONENTS)
+    combo_cols = [f'{c}_Combo' for c in FORCE_COMPONENTS]
+    empty = pd.DataFrame(columns=['Story', 'Label'] + FORCE_COMPONENTS + combo_cols)
 
     if sheet_name not in wb.sheetnames:
         return empty
@@ -109,6 +112,10 @@ def _parse_forces_from_wb(wb, member_type: str) -> pd.DataFrame:
     if story_i is None or label_i is None:
         return empty
 
+    # Design Forces sheets use 'Combo' or 'Load Combination'; Element Forces use 'Output Case'
+    _oc_candidates = ['Combo', 'Load Combination', 'Output Case', 'OutputCase', 'Load Case/Combo']
+    output_case_i = next((col_map[k] for k in _oc_candidates if k in col_map), None)
+
     force_col_indices = {c: col_map.get(c) for c in FORCE_COMPONENTS}
     accum: dict = {}
 
@@ -119,15 +126,22 @@ def _parse_forces_from_wb(wb, member_type: str) -> pd.DataFrame:
         label = vals[label_i] if label_i < n else None
         if story is None or label is None:
             continue
+        output_case = (
+            str(vals[output_case_i])
+            if output_case_i is not None and output_case_i < n and vals[output_case_i] is not None
+            else ''
+        )
         key = (story, label)
         if key not in accum:
-            accum[key] = dict.fromkeys(FORCE_COMPONENTS, 0.0)
+            accum[key] = {c: 0.0 for c in FORCE_COMPONENTS}
+            accum[key].update({f'{c}_Combo': '' for c in FORCE_COMPONENTS})
         for c, ci in force_col_indices.items():
             if ci is not None and ci < n and vals[ci] is not None:
                 try:
                     v = float(vals[ci])
                     if abs(v) > abs(accum[key][c]):
                         accum[key][c] = v
+                        accum[key][f'{c}_Combo'] = output_case
                 except (TypeError, ValueError):
                     pass
 
@@ -265,7 +279,7 @@ def _get_parsed_file(file_obj) -> tuple:
     file_bytes = file_obj.getvalue_binary()
     h = hashlib.md5(file_bytes).hexdigest()
 
-    cached = get_cached('etabs_parse', h)
+    cached = get_cached('etabs_parsev3', h)
     if cached is not None:
         return h, cached
 
@@ -285,16 +299,17 @@ def _get_parsed_file(file_obj) -> tuple:
         finally:
             wb.close()
     except Exception:
+        _combo_cols = [f'{c}_Combo' for c in FORCE_COMPONENTS]
         result = {
             'summary': pd.DataFrame(),
             'forces': {
-                mt: pd.DataFrame(columns=['Story', 'Label'] + FORCE_COMPONENTS)
+                mt: pd.DataFrame(columns=['Story', 'Label'] + FORCE_COMPONENTS + _combo_cols)
                 for mt in ('Columns', 'Beams', 'Braces')
             },
             'sheet_names': [],
         }
 
-    set_cached('etabs_parse', h, result)
+    set_cached('etabs_parsev3', h, result)
     return h, result
 
 
@@ -350,39 +365,50 @@ def _fmt(val, decimals=3):
     return val
 
 
+def _gov_combo(series, forces: list) -> str:
+    """Return the OutputCase that drove the max absolute value among the given governing forces."""
+    if series is None:
+        return 'N/A'
+    best_val, best_combo = 0.0, ''
+    for c in forces:
+        try:
+            v = abs(float(series[c]))
+            if v > best_val:
+                best_val = v
+                best_combo = str(series.get(f'{c}_Combo', '') or '')
+        except (TypeError, ValueError, KeyError):
+            pass
+    return best_combo or 'N/A'
+
+
 # ---------------------------------------------------------------------------
 # Fail reason helper
 # ---------------------------------------------------------------------------
 
 def _compute_fail_reason(row: dict, threshold: float, load_type: str,
-                          any_sign_rev: bool, is_fail: bool) -> str:
+                          any_sign_rev: bool, is_fail: bool, gov_forces: list) -> str:
     """
-    Build a human-readable string describing the primary cause of a FAIL.
+    Build a human-readable string for the primary cause of a FLAG/WARN.
 
+    Only checks gov_forces — non-governing forces do not appear in the reason.
     Returns '' for passing or non-comparable rows.
     """
     if not is_fail:
         return ''
 
-    # Priority 1: any force component jumped from ~zero (INF change)
-    for c in FORCE_COMPONENTS:
+    # Priority 1: governing force jumped from ~zero (INF change)
+    for c in gov_forces:
         if row.get(f'{c}_Pct') == 'INF':
             return f'{c} INF ({load_type})'
-    if row.get('PMM_Pct') == 'INF':
-        return f'PMM INF ({load_type})'
 
-    # Priority 2: largest % overage across forces and PMM
+    # Priority 2: largest % overage among governing forces
     worst_label = None
     worst_pct = 0.0
-    for c in FORCE_COMPONENTS:
+    for c in gov_forces:
         pct = row.get(f'{c}_Pct')
         if isinstance(pct, float) and pct > threshold and pct > worst_pct:
             worst_pct = pct
             worst_label = c
-    pmm_pct = row.get('PMM_Pct')
-    if isinstance(pmm_pct, float) and pmm_pct > threshold and pmm_pct > worst_pct:
-        worst_pct = pmm_pct
-        worst_label = 'PMM'
 
     if worst_label is not None:
         sign_tag = ' [sign rev]' if any_sign_rev else ''
@@ -401,10 +427,17 @@ def _run_comparison_internal(
     member_type_filter: str,
     gravity_threshold: float,
     lateral_threshold: float,
+    gravity_warn_threshold: float,
+    lateral_warn_threshold: float,
 ) -> list:
     """
     Core comparison logic. Operates on pre-parsed DataFrames.
     Returns the full unfiltered result list.
+
+    Flagging uses only GOVERNING_FORCES per member type; PMM D/C is computed
+    and stored for display but does not drive FLAG/WARN status.
+    Load type (gravity/lateral) is derived from the per-force governing combo,
+    with fallback to PMMCombo from the design summary.
     """
     types_to_process = (
         ['Columns', 'Beams', 'Braces']
@@ -463,6 +496,8 @@ def _run_comparison_internal(
         fe_lookup = _build_force_lookup(forces_exist)
         fn_lookup = _build_force_lookup(forces_new)
 
+        gov_forces = GOVERNING_FORCES[mtype]
+
         for story, label in sorted(all_members, key=lambda x: (str(x[0]), str(x[1]))):
             in_exist = (story, label) in exist_members
             in_new   = (story, label) in new_members
@@ -483,7 +518,7 @@ def _run_comparison_internal(
                 row.update({
                     'DesignSection_Exist': es.get('DesignSection', '') if es is not None else '',
                     'DesignSection_New':   'N/A',
-                    'GovCombo_Exist': es.get('PMMCombo', '') if es is not None else '',
+                    'GovCombo_Exist': _gov_combo(ef, gov_forces) if ef is not None else (es.get('PMMCombo', '') if es is not None else ''),
                     'GovCombo_New':   'N/A',
                     'LoadType': 'N/A',
                     'PMM_Exist': _fmt(es.get('PMMRatio')) if es is not None else 'N/A',
@@ -503,12 +538,14 @@ def _run_comparison_internal(
 
             # ---- ADDED ----
             if not in_exist:
+                n_gov_c = _gov_combo(nf, gov_forces) if nf is not None else 'N/A'
+                n_load_type = classify_combo(n_gov_c if n_gov_c != 'N/A' else (ns.get('PMMCombo', '') if ns is not None else ''))
                 row.update({
                     'DesignSection_Exist': 'N/A',
                     'DesignSection_New':   ns.get('DesignSection', '') if ns is not None else '',
                     'GovCombo_Exist': 'N/A',
-                    'GovCombo_New': ns.get('PMMCombo', '') if ns is not None else '',
-                    'LoadType': classify_combo(ns.get('PMMCombo', '') if ns is not None else ''),
+                    'GovCombo_New': n_gov_c,
+                    'LoadType': n_load_type,
                     'PMM_Exist': 'N/A',
                     'PMM_New': _fmt(ns.get('PMMRatio')) if ns is not None else 'N/A',
                     'PMM_Pct': 'N/A',
@@ -527,33 +564,27 @@ def _run_comparison_internal(
                 continue
 
             # ---- MATCHED ----
-            e_sec       = es.get('DesignSection', '') if es is not None else ''
-            n_sec       = ns.get('DesignSection', '') if ns is not None else ''
-            e_pmm_combo = es.get('PMMCombo', '')      if es is not None else ''
-            n_pmm_combo = ns.get('PMMCombo', '')      if ns is not None else ''
+            e_sec  = es.get('DesignSection', '') if es is not None else ''
+            n_sec  = ns.get('DesignSection', '') if ns is not None else ''
             e_pmm  = float(es['PMMRatio'])  if es is not None and pd.notna(es.get('PMMRatio'))  else None
             n_pmm  = float(ns['PMMRatio'])  if ns is not None and pd.notna(ns.get('PMMRatio'))  else None
             e_vmaj = float(es['VMajRatio']) if es is not None and pd.notna(es.get('VMajRatio')) else None
             n_vmaj = float(ns['VMajRatio']) if ns is not None and pd.notna(ns.get('VMajRatio')) else None
 
-            load_type = classify_combo(n_pmm_combo)
-            threshold = lateral_threshold if load_type == 'lateral' else gravity_threshold
+            # Governing combos from per-force data; fall back to PMMCombo if unavailable
+            e_gov_combo = _gov_combo(ef, gov_forces) if ef is not None else (es.get('PMMCombo', '') if es is not None else 'N/A')
+            n_gov_combo = _gov_combo(nf, gov_forces) if nf is not None else (ns.get('PMMCombo', '') if ns is not None else 'N/A')
+            # Overall load type from governing combo — used as display fallback only
+            overall_load_type = classify_combo(n_gov_combo if n_gov_combo != 'N/A' else (ns.get('PMMCombo', '') if ns is not None else ''))
 
             row['DesignSection_Exist'] = e_sec
             row['DesignSection_New']   = n_sec
-            row['GovCombo_Exist']      = e_pmm_combo
-            row['GovCombo_New']        = n_pmm_combo
-            row['LoadType']            = load_type
+            row['GovCombo_Exist']      = e_gov_combo
+            row['GovCombo_New']        = n_gov_combo
 
-            # D/C ratios
-            if e_pmm is not None and n_pmm is not None:
-                pmm_pct, _ = _pct_change(e_pmm, n_pmm)
-            else:
-                pmm_pct = 'N/A'
-            if e_vmaj is not None and n_vmaj is not None:
-                vmaj_pct, _ = _pct_change(e_vmaj, n_vmaj)
-            else:
-                vmaj_pct = 'N/A'
+            # D/C ratios — computed for display; do not drive FLAG/WARN
+            pmm_pct  = _pct_change(e_pmm,  n_pmm)[0]  if e_pmm  is not None and n_pmm  is not None else 'N/A'
+            vmaj_pct = _pct_change(e_vmaj, n_vmaj)[0] if e_vmaj is not None and n_vmaj is not None else 'N/A'
 
             row['PMM_Exist']  = _fmt(e_pmm)  if e_pmm  is not None else 'N/A'
             row['PMM_New']    = _fmt(n_pmm)  if n_pmm  is not None else 'N/A'
@@ -564,6 +595,12 @@ def _run_comparison_internal(
 
             any_sign_rev = False
             is_fail = False
+            is_warn = False
+            # worst_fail / worst_warn: keyed by load type → (force, numeric_pct, raw_pct_val)
+            # Tracks the worst flagging force independently per load type so both
+            # gravity and lateral overages can surface in the FailReason.
+            worst_fail: dict = {}
+            worst_warn: dict = {}
 
             for c in FORCE_COMPONENTS:
                 e_val = _fmt(float(ef[c]), 2) if ef is not None else 'No Data'
@@ -577,18 +614,65 @@ def _run_comparison_internal(
                     row[f'{c}_Pct'] = pct
                     if sign_rev:
                         any_sign_rev = True
-                    if pct == 'INF' or (isinstance(pct, float) and pct > threshold):
-                        is_fail = True
+                    # Each governing force evaluated against the threshold for its own combo's load type
+                    if c in gov_forces:
+                        c_combo = str(nf.get(f'{c}_Combo', '') or '') if nf is not None else ''
+                        c_load_type = classify_combo(c_combo)
+                        row[f'{c}_LoadType'] = c_load_type
+                        c_fail_thresh = lateral_threshold      if c_load_type == 'lateral' else gravity_threshold
+                        c_warn_thresh = lateral_warn_threshold if c_load_type == 'lateral' else gravity_warn_threshold
+                        numeric_pct = 999.0 if pct == 'INF' else (pct if isinstance(pct, float) else None)
+                        if numeric_pct is not None:
+                            if numeric_pct > c_fail_thresh:
+                                is_fail = True
+                                if numeric_pct > worst_fail.get(c_load_type, (None, 0.0, None))[1]:
+                                    worst_fail[c_load_type] = (c, numeric_pct, pct)
+                            elif numeric_pct > c_warn_thresh:
+                                is_warn = True
+                                if numeric_pct > worst_warn.get(c_load_type, (None, 0.0, None))[1]:
+                                    worst_warn[c_load_type] = (c, numeric_pct, pct)
                 else:
                     row[f'{c}_Pct'] = 'N/A'
 
-            # D/C threshold check
-            if pmm_pct == 'INF' or (isinstance(pmm_pct, float) and pmm_pct > threshold):
-                is_fail = True
-
             row['SignReversal'] = 'YES' if any_sign_rev else ''
-            row['FailReason']   = _compute_fail_reason(row, threshold, load_type, any_sign_rev, is_fail)
-            row['Pass']         = 'FLAG' if is_fail else 'PASS'
+
+            def _reason_parts(worst_dict: dict, thresh_fn) -> list:
+                """Build one reason string per load type, sorted lateral-first."""
+                parts = []
+                for lt in sorted(worst_dict, key=lambda x: (x != 'lateral')):
+                    c, _, pv = worst_dict[lt]
+                    ft = thresh_fn(lt)
+                    parts.append(
+                        f'{c} INF ({lt})' if pv == 'INF'
+                        else f'{c} +{pv:.1f}% > {ft:.0f}% {lt}'
+                    )
+                return parts
+
+            sign_tag = ' [sign rev]' if any_sign_rev else ''
+
+            # LoadType on the row: load type of the highest-overage flagging force
+            # (used for gravity/lateral counts in the summary; 'mixed' when both flag)
+            def _primary_load_type(worst_dict: dict) -> str:
+                if not worst_dict:
+                    return overall_load_type
+                if len(worst_dict) == 1:
+                    return next(iter(worst_dict))
+                return max(worst_dict, key=lambda lt: worst_dict[lt][1])
+
+            if is_fail:
+                parts = _reason_parts(worst_fail, lambda lt: lateral_threshold if lt == 'lateral' else gravity_threshold)
+                row['FailReason'] = ' | '.join(parts) + sign_tag
+                row['LoadType']   = _primary_load_type(worst_fail)
+                row['Pass']       = 'FLAG'
+            elif is_warn:
+                parts = _reason_parts(worst_warn, lambda lt: lateral_warn_threshold if lt == 'lateral' else gravity_warn_threshold)
+                row['FailReason'] = ' | '.join(parts) + sign_tag
+                row['LoadType']   = _primary_load_type(worst_warn)
+                row['Pass']       = 'WARN'
+            else:
+                row['FailReason'] = ''
+                row['LoadType']   = overall_load_type
+                row['Pass']       = 'PASS'
 
             all_results.append(row)
 
@@ -605,7 +689,9 @@ def run_comparison(
     member_type_filter: str,
     gravity_threshold: float,
     lateral_threshold: float,
-    show_failures_only: bool,
+    gravity_warn_threshold: float = 2.5,
+    lateral_warn_threshold: float = 5.0,
+    show_failures_only: bool = False,
 ) -> list:
     """
     Compare ETABS design output between two models.
@@ -621,18 +707,20 @@ def run_comparison(
     exist_hash, parsed_exist = _get_parsed_file(existing_file)
     new_hash,   parsed_new   = _get_parsed_file(modified_file)
     cache_key  = (exist_hash, new_hash, member_type_filter,
-                  gravity_threshold, lateral_threshold)
+                  gravity_threshold, lateral_threshold,
+                  gravity_warn_threshold, lateral_warn_threshold)
 
-    all_results = get_cached('etabs_cmp', cache_key)
+    all_results = get_cached('etabs_cmpv4', cache_key)
     if all_results is None:
         all_results = _run_comparison_internal(
             parsed_exist, parsed_new,
             member_type_filter, gravity_threshold, lateral_threshold,
+            gravity_warn_threshold, lateral_warn_threshold,
         )
-        set_cached('etabs_cmp', cache_key, all_results)
+        set_cached('etabs_cmpv4', cache_key, all_results)
 
     if show_failures_only:
-        return [r for r in all_results if r.get('Pass') == 'FLAG']
+        return [r for r in all_results if r.get('Pass') in ('FLAG', 'WARN')]
     return list(all_results)
 
 
