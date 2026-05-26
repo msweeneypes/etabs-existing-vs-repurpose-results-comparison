@@ -59,12 +59,18 @@ near-instant.
 
 | Field | Default | Meaning |
 |---|---|---|
-| Gravity Load Threshold | 5% | Max allowable increase for gravity combos |
-| Lateral Load Threshold | 10% | Max allowable increase for lateral combos |
+| Gravity Flag Threshold | 5% | Governing force increase above this triggers FLAG for gravity combos |
+| Gravity Warn Threshold | 2.5% | Governing force increase above this triggers WARN for gravity combos |
+| Lateral Flag Threshold | 10% | Governing force increase above this triggers FLAG for lateral combos |
+| Lateral Warn Threshold | 5% | Governing force increase above this triggers WARN for lateral combos |
 
-Load type (gravity vs. lateral) is determined from the governing combo name.
-Combos containing `WA`, `WB`, `WG` (wind) or `EQ`, `EQB` (seismic) tokens are
-classified as lateral; all others are gravity.
+Load type (gravity vs. lateral) is determined **per force**, from the combo that
+drove each force's maximum value. Combos containing `WA`, `WB`, `WG` (wind) or
+`EQ`, `EQB` (seismic) tokens are classified as lateral; all others are gravity.
+Each governing force is checked against the threshold for its own combo's load
+type — so a member can flag on both gravity and lateral simultaneously if
+different forces are governed by different combo types. When this occurs, both
+reasons appear in the Flag Reason column separated by `|`.
 
 **Analysis mode thresholds**
 
@@ -114,12 +120,11 @@ to see every member.
 | Column | Description |
 |---|---|
 | Story / Label / Type | Member identification |
-| Load Type | gravity or lateral |
-| Section (Exist/New) | Design section from ETABS |
-| PMM (Exist/New/%) | AISC 360-16 H1-1 interaction ratio and percent change |
-| V Major D/C | Percent change in major-axis shear D/C ratio |
-| Worst Force % | Largest percent increase among P, V2, V3, T, M2, M3 |
-| Flag Reason | Plain-language description of what triggered the flag |
+| Load Type | gravity or lateral (derived from the worst flagging force's combo) |
+| P / V2 / M3 / M2 (New) | Modified model force value for each component |
+| P / V2 / M3 / M2 (%) | Percent change from existing |
+| Worst (%) | Largest percent increase among all governing forces |
+| Flag Reason | What triggered the flag, including load type. Shows both gravity and lateral entries separated by `\|` when applicable |
 | Result | PASS / FLAG / WARN / ADDED / REMOVED |
 
 **Analysis mode columns:**
@@ -165,8 +170,9 @@ table with threshold highlighting, and D/C ratios (Design mode).
 
 ### Key Metrics
 
-High-level summary: total members compared, FLAG/WARN/PASS counts, worst member
-by type, and top-5 flagged members.
+High-level summary: total members compared, FLAG/WARN/PASS counts broken down
+by gravity and lateral, failure rate, worst force change, and most affected
+story.
 
 ### By Story
 
@@ -186,14 +192,16 @@ for exporting context or investigating specific members. Controlled by the
 | Status | Meaning |
 |---|---|
 | **PASS** | All governing forces within threshold |
-| **FLAG** | Threshold exceeded; review required |
-| **WARN** | Threshold exceeded, but demand decreased overall or member is well below capacity (PMM < 0.95) |
+| **WARN** | A governing force exceeded the warn threshold but not the flag threshold — increase is notable, review advised |
+| **FLAG** | A governing force exceeded the flag threshold; review required |
 | **ADDED** | Member exists only in the modified model |
 | **REMOVED** | Member exists only in the existing model |
 
 FLAG does not imply a design failure. It flags members where the percent
 increase in demand crosses the IBC 3403 threshold and requires engineering
-judgment.
+judgment. PMM (P-M-M interaction ratio) is computed and shown in the Member
+Detail card for reference but does not drive FLAG or WARN status — force
+envelope changes are the sole trigger.
 
 **INF** in a percent change column means the existing model force was
 effectively zero (< 0.01) while the new model is non-zero. Evaluate the
