@@ -124,6 +124,58 @@ def _net_demand(r: dict) -> str:
     return 'MIXED'
 
 
+_RESULT_HEX = {
+    'PASS':    '#228B22',
+    'FLAG':    '#B22222',
+    'WARN':    '#B48200',
+    'ADDED':   '#1E64C8',
+    'REMOVED': '#B46400',
+}
+
+
+def _build_html_table(headers: list, rows: list, col_widths: list) -> str:
+    """Render a scrollable HTML table with fixed column widths.
+
+    rows: list of lists; last column is treated as the Pass/Result cell
+    (its value is a string like 'FLAG', 'PASS', etc. and gets coloured).
+    col_widths: pixel widths matching headers length.
+    """
+    th_style = (
+        'background:#2b4f76;color:#fff;padding:6px 8px;'
+        'white-space:nowrap;border:1px solid #1e3a5c;font-size:12px;'
+        'position:sticky;top:0;z-index:2;'
+    )
+    td_base = 'padding:5px 8px;border:1px solid #ddd;white-space:nowrap;font-size:12px;'
+
+    col_tags = ''.join(f'<col style="min-width:{w}px;width:{w}px">' for w in col_widths)
+    header_cells = ''.join(f'<th style="{th_style}">{h}</th>' for h in headers)
+
+    body_rows = []
+    for i, row in enumerate(rows):
+        bg = '#f9f9f9' if i % 2 == 0 else '#ffffff'
+        cells = []
+        for j, cell in enumerate(row):
+            if j == len(row) - 1:
+                # Result column — colour by pass value
+                color = _RESULT_HEX.get(str(cell), '#888888')
+                cells.append(
+                    f'<td style="{td_base}background:{color};color:#fff;'
+                    f'font-weight:600;text-align:center">{cell}</td>'
+                )
+            else:
+                cells.append(f'<td style="{td_base}background:{bg}">{cell}</td>')
+        body_rows.append(f'<tr>{"".join(cells)}</tr>')
+
+    return (
+        '<div style="overflow-x:auto;max-height:80vh;overflow-y:auto">'
+        f'<table style="border-collapse:collapse;width:max-content">'
+        f'<colgroup>{col_tags}</colgroup>'
+        f'<thead><tr>{header_cells}</tr></thead>'
+        f'<tbody>{"".join(body_rows)}</tbody>'
+        '</table></div>'
+    )
+
+
 def _postprocess_results(results: list) -> list:
     """Add NetDemand to each result row. WARN/FLAG status is set at comparison time."""
     out = []
@@ -231,6 +283,29 @@ def validate_step1(params, **kwargs):
             'Both ETABS design output files must be uploaded before proceeding.',
             input_violations=violations,
         )
+
+
+def _get_story_options(params, **kwargs):
+    """Return unique story names from the uploaded existing-model file for the Story dropdown."""
+    try:
+        if not params.step1.existing_file:
+            return ['(any)']
+        mode = params.step1.mode or 'Design Results'
+        if mode == 'Analysis Results':
+            from analysis_comparison import _get_parsed_analysis_file, ANALYSIS_FORCES_SHEETS
+            _, parsed = _get_parsed_analysis_file(params.step1.existing_file.file)
+            sheets = ANALYSIS_FORCES_SHEETS
+        else:
+            _, parsed = _get_parsed_file(params.step1.existing_file.file)
+            sheets = DESIGN_FORCES_SHEETS
+        stories = set()
+        for mt in sheets:
+            df = parsed.get('forces', {}).get(mt)
+            if df is not None and 'Story' in df.columns:
+                stories.update(df['Story'].dropna().astype(str).str.strip().unique())
+        return ['(any)'] + sorted(s for s in stories if s)
+    except Exception:
+        return ['(any)']
 
 
 # ---------------------------------------------------------------------------
@@ -466,9 +541,10 @@ Start with the **Braces**, **Columns**, or **Beams** tab for focused review. Eac
         'Member Label',
         description='Label to look up (e.g. "C12"). Case-insensitive.',
     )
-    step2.section_detail.detail_story = vkt.TextField(
+    step2.section_detail.detail_story = vkt.OptionField(
         'Story (optional)',
-        description='Specify story if the label appears on multiple stories.',
+        options=_get_story_options,
+        description='Select a story to narrow the search, or leave as "(any)" to match all stories.',
     )
 
     step2.section_ai = vkt.Section('AI Assistant')
@@ -1067,7 +1143,8 @@ class Controller(vkt.Controller):
             lateral_warn_thresh = float(p.lateral_warn_threshold or 5)
 
         search_label = (d.detail_label or '').strip()
-        search_story = (d.detail_story or '').strip().lower()
+        _raw_story = (d.detail_story or '').strip()
+        search_story = '' if _raw_story == '(any)' else _raw_story.lower()
 
         all_results = self._run_analysis_all(params) if is_analysis else self._run_all(params)
 
@@ -1096,7 +1173,7 @@ class Controller(vkt.Controller):
 
     # -- Typed member-class tabs -----------------------------------------------
 
-    @vkt.TableView('Braces', duration_guess=2)
+    @vkt.WebView('Braces', duration_guess=2)
     def braces_table(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
@@ -1114,6 +1191,7 @@ class Controller(vkt.Controller):
                 'P (Exist)', 'P (New)', 'P (%)',
                 'Worst (%)', 'Flag Reason', 'Result',
             ]
+            col_widths = [90, 80, 180, 180, 85, 85, 75, 85, 180, 70]
             data = []
             for r in results:
                 data.append([
@@ -1122,7 +1200,7 @@ class Controller(vkt.Controller):
                     r.get('P_Exist', ''), r.get('P_New', ''),
                     _fmt_pct(r.get('P_Pct', '')),
                     _fmt_pct(r.get('WorstPct', '')),
-                    r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
+                    r.get('FailReason', ''), r.get('Pass', ''),
                 ])
         else:
             headers = [
@@ -1131,6 +1209,7 @@ class Controller(vkt.Controller):
                 'P (Exist)', 'P (New)', 'P (%)',
                 'Flag Reason', 'Result',
             ]
+            col_widths = [90, 80, 130, 130, 180, 180, 90, 85, 85, 75, 180, 70]
             data = []
             for r in results:
                 data.append([
@@ -1140,11 +1219,11 @@ class Controller(vkt.Controller):
                     r.get('LoadType', ''),
                     r.get('P_Exist', ''), r.get('P_New', ''),
                     _fmt_pct(r.get('P_Pct', '')),
-                    r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
+                    r.get('FailReason', ''), r.get('Pass', ''),
                 ])
-        return vkt.TableResult(data, column_headers=headers)
+        return vkt.WebResult(html=_build_html_table(headers, data, col_widths))
 
-    @vkt.TableView('Columns', duration_guess=2)
+    @vkt.WebView('Columns', duration_guess=2)
     def columns_table(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
@@ -1164,6 +1243,7 @@ class Controller(vkt.Controller):
                 'M2 (Exist)', 'M2 (New)', 'M2 (%)',
                 'Worst (%)', 'Flag Reason', 'Result',
             ]
+            col_widths = [90, 80, 180, 180, 85, 85, 75, 85, 85, 75, 85, 85, 75, 85, 180, 70]
             data = []
             for r in results:
                 data.append([
@@ -1176,7 +1256,7 @@ class Controller(vkt.Controller):
                     r.get('M2_Exist', ''), r.get('M2_New', ''),
                     _fmt_pct(r.get('M2_Pct', '')),
                     _fmt_pct(r.get('WorstPct', '')),
-                    r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
+                    r.get('FailReason', ''), r.get('Pass', ''),
                 ])
         else:
             headers = [
@@ -1187,6 +1267,7 @@ class Controller(vkt.Controller):
                 'M2 (Exist)', 'M2 (New)', 'M2 (%)',
                 'Flag Reason', 'Result',
             ]
+            col_widths = [90, 80, 130, 130, 180, 180, 90, 85, 85, 75, 85, 85, 75, 85, 85, 75, 180, 70]
             data = []
             for r in results:
                 data.append([
@@ -1200,11 +1281,11 @@ class Controller(vkt.Controller):
                     _fmt_pct(r.get('M3_Pct', '')),
                     r.get('M2_Exist', ''), r.get('M2_New', ''),
                     _fmt_pct(r.get('M2_Pct', '')),
-                    r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
+                    r.get('FailReason', ''), r.get('Pass', ''),
                 ])
-        return vkt.TableResult(data, column_headers=headers)
+        return vkt.WebResult(html=_build_html_table(headers, data, col_widths))
 
-    @vkt.TableView('Beams', duration_guess=2)
+    @vkt.WebView('Beams', duration_guess=2)
     def beams_table(self, params, **kwargs):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
@@ -1223,6 +1304,7 @@ class Controller(vkt.Controller):
                 'V2 (Exist)', 'V2 (New)', 'V2 (%)',
                 'Worst (%)', 'Flag Reason', 'Result',
             ]
+            col_widths = [90, 80, 180, 180, 85, 85, 75, 85, 85, 75, 85, 180, 70]
             data = []
             for r in results:
                 data.append([
@@ -1233,7 +1315,7 @@ class Controller(vkt.Controller):
                     r.get('V2_Exist', ''), r.get('V2_New', ''),
                     _fmt_pct(r.get('V2_Pct', '')),
                     _fmt_pct(r.get('WorstPct', '')),
-                    r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
+                    r.get('FailReason', ''), r.get('Pass', ''),
                 ])
         else:
             headers = [
@@ -1243,6 +1325,7 @@ class Controller(vkt.Controller):
                 'V2 (Exist)', 'V2 (New)', 'V2 (%)',
                 'Flag Reason', 'Result',
             ]
+            col_widths = [90, 80, 130, 130, 180, 180, 90, 85, 85, 75, 85, 85, 75, 180, 70]
             data = []
             for r in results:
                 data.append([
@@ -1254,9 +1337,9 @@ class Controller(vkt.Controller):
                     _fmt_pct(r.get('M3_Pct', '')),
                     r.get('V2_Exist', ''), r.get('V2_New', ''),
                     _fmt_pct(r.get('V2_Pct', '')),
-                    r.get('FailReason', ''), _result_cell(r.get('Pass', '')),
+                    r.get('FailReason', ''), r.get('Pass', ''),
                 ])
-        return vkt.TableResult(data, column_headers=headers)
+        return vkt.WebResult(html=_build_html_table(headers, data, col_widths))
 
     def _find_worst_beam(self, results: list) -> Optional[dict]:
         beams = [r for r in results if r.get('MemberType') == 'Beam'
