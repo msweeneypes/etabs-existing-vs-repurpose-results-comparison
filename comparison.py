@@ -40,6 +40,7 @@ LABEL_COL = {
 }
 
 SUMMARY_SHEET_PREFIX = 'Stl Frm Sum'
+COMPOSITE_BEAM_SUMMARY_PREFIX = 'Comp Bm Sum'
 
 # Design type string as it appears in the Design Summary sheet
 DESIGN_TYPE = {
@@ -152,46 +153,36 @@ def _parse_forces_from_wb(wb, member_type: str) -> pd.DataFrame:
     )
 
 
-def _parse_summary_from_wb(wb) -> pd.DataFrame:
-    """
-    Stream the Steel Frame Design Summary worksheet from an open workbook.
+_SUMMARY_EMPTY = pd.DataFrame(columns=[
+    'Story', 'Label', 'MemberType', 'DesignSection',
+    'PMMCombo', 'PMMRatio', 'VMajCombo', 'VMajRatio',
+])
 
-    Returns one row per member with design section and D/C ratio data.
-    """
-    empty = pd.DataFrame(columns=[
-        'Story', 'Label', 'MemberType', 'DesignSection',
-        'PMMCombo', 'PMMRatio', 'VMajCombo', 'VMajRatio',
-    ])
+_SUMMARY_NAME_REMAP = {
+    'Design Type':    'MemberType',
+    'Design Section': 'DesignSection',
+    'PMM Combo':      'PMMCombo',
+    'PMM Ratio':      'PMMRatio',
+    'V Major Combo':  'VMajCombo',
+    'V Major Ratio':  'VMajRatio',
+}
 
-    summary_sheet = next(
-        (s for s in wb.sheetnames if s.startswith(SUMMARY_SHEET_PREFIX)), None
-    )
-    if summary_sheet is None:
-        return empty
 
+def _parse_one_summary_sheet(ws) -> pd.DataFrame:
+    """Parse a single design-summary worksheet (steel or composite) into a DataFrame."""
     try:
-        col_map, rows_iter = _stream_etabs_rows(wb[summary_sheet])
+        col_map, rows_iter = _stream_etabs_rows(ws)
     except StopIteration:
-        return empty
+        return _SUMMARY_EMPTY.copy()
 
-    name_remap = {
-        'Design Type':    'MemberType',
-        'Design Section': 'DesignSection',
-        'PMM Combo':      'PMMCombo',
-        'PMM Ratio':      'PMMRatio',
-        'V Major Combo':  'VMajCombo',
-        'V Major Ratio':  'VMajRatio',
-    }
-    idx = {name_remap.get(k, k): i for k, i in col_map.items()}
-
+    idx = {_SUMMARY_NAME_REMAP.get(k, k): i for k, i in col_map.items()}
     story_i = idx.get('Story')
     label_i = idx.get('Label')
     if story_i is None or label_i is None:
-        return empty
+        return _SUMMARY_EMPTY.copy()
 
     extra_fields = ('MemberType', 'DesignSection', 'PMMCombo', 'PMMRatio', 'VMajCombo', 'VMajRatio')
     rows_out = []
-
     for row in rows_iter:
         vals = [cell.value for cell in row]
         n    = len(vals)
@@ -206,11 +197,10 @@ def _parse_summary_from_wb(wb) -> pd.DataFrame:
         rows_out.append(row_dict)
 
     if not rows_out:
-        return empty
+        return _SUMMARY_EMPTY.copy()
 
     df = pd.DataFrame(rows_out)
     df = df[df['Label'].notna()].copy()
-
     for col in ('PMMCombo', 'VMajCombo'):
         if col in df.columns:
             df[col] = (
@@ -221,8 +211,40 @@ def _parse_summary_from_wb(wb) -> pd.DataFrame:
     for col in ('PMMRatio', 'VMajRatio'):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-
     return df
+
+
+def _parse_summary_from_wb(wb) -> pd.DataFrame:
+    """
+    Stream design summary worksheet(s) from an open workbook.
+
+    Reads Steel Frame Design Summary (prefix 'Stl Frm Sum') and, when present,
+    Composite Beam Design Summary (prefix 'Comp Bm Sum').  Composite beam rows
+    are normalised to MemberType='Beam' so the existing comparison logic handles
+    them without modification.  Both sheets share the same column schema.
+    """
+    frames = []
+
+    steel_sheet = next(
+        (s for s in wb.sheetnames if s.startswith(SUMMARY_SHEET_PREFIX)), None
+    )
+    if steel_sheet is not None:
+        frames.append(_parse_one_summary_sheet(wb[steel_sheet]))
+
+    comp_sheet = next(
+        (s for s in wb.sheetnames if s.startswith(COMPOSITE_BEAM_SUMMARY_PREFIX)), None
+    )
+    if comp_sheet is not None:
+        comp_df = _parse_one_summary_sheet(wb[comp_sheet])
+        if not comp_df.empty and 'MemberType' in comp_df.columns:
+            comp_df['MemberType'] = 'Beam'
+        frames.append(comp_df)
+
+    if not frames:
+        return _SUMMARY_EMPTY.copy()
+
+    combined = pd.concat(frames, ignore_index=True)
+    return combined if not combined.empty else _SUMMARY_EMPTY.copy()
 
 
 # ---------------------------------------------------------------------------
