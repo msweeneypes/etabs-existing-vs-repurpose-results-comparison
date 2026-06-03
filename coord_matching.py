@@ -190,6 +190,30 @@ def build_label_map(
     return label_map, warnings
 
 
+def build_label_map_from_indices(exist_index: dict, new_index: dict) -> tuple:
+    """
+    Build a {new_label: existing_label} map from two pre-parsed coord indices.
+
+    Equivalent to build_label_map but works from already-extracted dicts so no
+    workbook I/O is required.  Returns (label_map, unmatched_labels).
+    """
+    if not exist_index or not new_index:
+        return {}, []
+
+    geom_to_exist = {v: k for k, v in exist_index.items()}
+
+    label_map: dict = {}
+    unmatched: list = []
+    for new_label, geom_key in new_index.items():
+        exist_label = geom_to_exist.get(geom_key)
+        if exist_label is not None:
+            label_map[new_label] = exist_label
+        else:
+            unmatched.append(str(new_label))
+
+    return label_map, unmatched
+
+
 def apply_label_map(parsed_dict: dict, label_map: dict) -> dict:
     """
     Return a shallow copy of parsed_dict with Label values remapped per label_map.

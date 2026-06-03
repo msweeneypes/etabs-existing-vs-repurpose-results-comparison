@@ -116,10 +116,12 @@ def _parse_analysis_forces_from_wb(wb, member_type: str) -> pd.DataFrame:
 
 def _get_parsed_analysis_file(file_obj) -> tuple:
     """Return (hash, parsed_dict), computing and caching on first call."""
+    from coord_matching import parse_coord_index
+
     file_bytes = file_obj.getvalue_binary()
     h = hashlib.md5(file_bytes).hexdigest()
 
-    cached = get_cached('etabs_aparsev3', h)
+    cached = get_cached('etabs_aparsev4', h)
     if cached is not None:
         return h, cached
 
@@ -134,6 +136,7 @@ def _get_parsed_analysis_file(file_obj) -> tuple:
                     for mt in ('Columns', 'Beams', 'Braces')
                 },
                 'sheet_names': list(wb.sheetnames),
+                'coord_index': parse_coord_index(wb),
             }
         finally:
             wb.close()
@@ -144,9 +147,10 @@ def _get_parsed_analysis_file(file_obj) -> tuple:
                 for mt in ('Columns', 'Beams', 'Braces')
             },
             'sheet_names': [],
+            'coord_index': {},
         }
 
-    set_cached('etabs_aparsev3', h, result)
+    set_cached('etabs_aparsev4', h, result)
     return h, result
 
 

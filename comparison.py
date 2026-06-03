@@ -293,15 +293,22 @@ def _get_parsed_file(file_obj) -> tuple:
     """
     Return (file_hash, parsed_dict) for a file, computing and caching if absent.
 
-    Opens the workbook exactly once and reads all four sheets in a single pass.
-    File bytes are released before parsing begins to minimise peak memory usage.
+    Opens the workbook exactly once and reads all sheets in a single pass,
+    including coord index extraction for By Coordinates matching.
 
-    parsed_dict = {'summary': df, 'forces': {'Columns': df, 'Beams': df, 'Braces': df}}
+    parsed_dict = {
+        'summary': df,
+        'forces': {'Columns': df, 'Beams': df, 'Braces': df},
+        'sheet_names': [...],
+        'coord_index': {label: geom_key, ...},   # empty dict if sheets absent
+    }
     """
+    from coord_matching import parse_coord_index
+
     file_bytes = file_obj.getvalue_binary()
     h = hashlib.md5(file_bytes).hexdigest()
 
-    cached = get_cached('etabs_parsev3', h)
+    cached = get_cached('etabs_parsev4', h)
     if cached is not None:
         return h, cached
 
@@ -317,6 +324,7 @@ def _get_parsed_file(file_obj) -> tuple:
                     for mt in ('Columns', 'Beams', 'Braces')
                 },
                 'sheet_names': list(wb.sheetnames),
+                'coord_index': parse_coord_index(wb),
             }
         finally:
             wb.close()
@@ -329,9 +337,10 @@ def _get_parsed_file(file_obj) -> tuple:
                 for mt in ('Columns', 'Beams', 'Braces')
             },
             'sheet_names': [],
+            'coord_index': {},
         }
 
-    set_cached('etabs_parsev3', h, result)
+    set_cached('etabs_parsev4', h, result)
     return h, result
 
 

@@ -1,15 +1,21 @@
-import io
 import re
+import traceback
 from typing import Optional
 
 import viktor as vkt
 from openai import OpenAI
-from openpyxl import load_workbook
 
-_llm_client = OpenAI(
-    base_url=vkt.ViktorOpenAI.get_base_url(version="v1"),
-    api_key=vkt.ViktorOpenAI.get_api_key(),
-)
+_llm_client = None
+
+
+def _get_llm_client():
+    global _llm_client
+    if _llm_client is None:
+        _llm_client = OpenAI(
+            base_url=vkt.ViktorOpenAI.get_base_url(version="v1"),
+            api_key=vkt.ViktorOpenAI.get_api_key(),
+        )
+    return _llm_client
 
 from comparison import (
     build_summary, results_to_csv, run_comparison, FORCE_COMPONENTS,
@@ -994,7 +1000,7 @@ class Controller(vkt.Controller):
             raise vkt.UserError('Please upload both model files in Step 1.')
 
         mode = params.step1.mode or 'Design Results'
-        all_results = self._run_analysis_all(params) if mode == 'Analysis Results' else self._run_all(params)
+        all_results = self._run_analysis_all_safe(params) if mode == 'Analysis Results' else self._run_all_safe(params)
         summary = build_summary(all_results)
         if not summary:
             raise vkt.UserError('No data to summarise.')
@@ -1034,7 +1040,7 @@ class Controller(vkt.Controller):
             raise vkt.UserError('Please upload both model files in Step 1.')
 
         mode = params.step1.mode or 'Design Results'
-        all_results = self._run_analysis_all(params) if mode == 'Analysis Results' else self._run_all(params)
+        all_results = self._run_analysis_all_safe(params) if mode == 'Analysis Results' else self._run_all_safe(params)
         if not all_results:
             raise vkt.UserError('No data.')
 
@@ -1158,7 +1164,7 @@ class Controller(vkt.Controller):
         _raw_story = (d.detail_story or '').strip()
         search_story = '' if _raw_story == '(any)' else _raw_story.lower()
 
-        all_results = self._run_analysis_all(params) if is_analysis else self._run_all(params)
+        all_results = self._run_analysis_all_safe(params) if is_analysis else self._run_all_safe(params)
 
         if search_label:
             candidates = [
@@ -1390,7 +1396,7 @@ class Controller(vkt.Controller):
         if not params.step1.existing_file or not params.step1.modified_file:
             raise vkt.UserError('Please upload both model files in Step 1.')
         mode = params.step1.mode or 'Design Results'
-        results = self._run_analysis_all(params) if mode == 'Analysis Results' else self._run_all(params)
+        results = self._run_analysis_all_safe(params) if mode == 'Analysis Results' else self._run_all_safe(params)
         export_type = params.step2.section_export.member_type_export or 'All'
         if export_type != 'All':
             singular = _TYPE_SINGULAR[export_type]
@@ -1525,7 +1531,7 @@ class Controller(vkt.Controller):
         ]
 
         try:
-            stream = _llm_client.chat.completions.create(
+            stream = _get_llm_client().chat.completions.create(
                 model="openai.gpt-oss-120b",
                 messages=messages,
                 stream=True,
@@ -1543,7 +1549,7 @@ class Controller(vkt.Controller):
 
     def _run(self, params):
         """Filtered results (respects display_filter param). Delegates to _run_all."""
-        results = self._run_all(params)
+        results = self._run_all_safe(params)
         if (params.step2.section_options.display_filter or 'Failures Only') == 'Failures Only':
             return [r for r in results if r.get('Pass') in ('FLAG', 'WARN')]
         return results
@@ -1554,7 +1560,7 @@ class Controller(vkt.Controller):
         Reduces cold-worker Storage reads from 3 (parse×2 + cmp) down to 1
         for every view after the first call with a given file+threshold combo.
         """
-        from coord_matching import apply_label_map, build_label_map
+        from coord_matching import apply_label_map, build_label_map_from_indices
 
         p         = params.step2.section_options
         grav      = float(p.gravity_threshold      or 5)
@@ -1565,10 +1571,10 @@ class Controller(vkt.Controller):
         nf = params.step1.modified_file.file
         matching_mode = getattr(params.step1, 'matching_mode', None) or 'By Label'
 
-        # _get_parsed_file downloads + parses once and warms _MEMORY so
-        # run_comparison's internal _get_parsed_file call is a free cache hit.
-        eh, _          = _get_parsed_file(ef)
-        nh, parsed_new = _get_parsed_file(nf)
+        # _get_parsed_file downloads + parses once (coord_index included) and
+        # warms _MEMORY so run_comparison's internal call is a free cache hit.
+        eh, parsed_exist = _get_parsed_file(ef)
+        nh, parsed_new   = _get_parsed_file(nf)
 
         label_map = {}
         if matching_mode == 'By Coordinates':
@@ -1577,16 +1583,10 @@ class Controller(vkt.Controller):
             if cached_map is not None:
                 label_map = cached_map
             else:
-                ef_bytes = ef.getvalue_binary()
-                nf_bytes = nf.getvalue_binary()
-                wb_e = load_workbook(io.BytesIO(ef_bytes), read_only=True, data_only=True)
-                wb_n = load_workbook(io.BytesIO(nf_bytes), read_only=True, data_only=True)
-                try:
-                    lmap, _ = build_label_map(wb_e, wb_n)
-                finally:
-                    wb_e.close()
-                    wb_n.close()
-                label_map = lmap
+                label_map, _ = build_label_map_from_indices(
+                    parsed_exist.get('coord_index', {}),
+                    parsed_new.get('coord_index', {}),
+                )
                 set_cached('etabs_labelmap', map_cache_key, label_map)
 
         cache_key_extra = (matching_mode, len(label_map))
@@ -1614,9 +1614,17 @@ class Controller(vkt.Controller):
         set_cached('etabs_postv4', key, processed)
         return processed
 
+    def _run_all_safe(self, params):
+        try:
+            return self._run_all(params)
+        except vkt.UserError:
+            raise
+        except Exception:
+            raise vkt.UserError(f'Comparison failed:\n{traceback.format_exc()}')
+
     def _run_analysis(self, params):
         """Filtered analysis results. Delegates to _run_analysis_all."""
-        results = self._run_analysis_all(params)
+        results = self._run_analysis_all_safe(params)
         if (params.step2.section_options.display_filter or 'Failures Only') == 'Failures Only':
             return [r for r in results if r.get('Pass') == 'FLAG']
         return results
@@ -1624,7 +1632,7 @@ class Controller(vkt.Controller):
     def _run_analysis_all(self, params):
         """Unfiltered analysis results, cached at the postprocess level."""
         from analysis_comparison import _get_parsed_analysis_file
-        from coord_matching import apply_label_map, build_label_map
+        from coord_matching import apply_label_map, build_label_map_from_indices
 
         p    = params.step2.section_options
         warn = float(p.warn_threshold or 5)
@@ -1633,8 +1641,8 @@ class Controller(vkt.Controller):
         nf   = params.step1.modified_file.file
         matching_mode = getattr(params.step1, 'matching_mode', None) or 'By Label'
 
-        eh, _          = _get_parsed_analysis_file(ef)
-        nh, parsed_new = _get_parsed_analysis_file(nf)
+        eh, parsed_exist = _get_parsed_analysis_file(ef)
+        nh, parsed_new   = _get_parsed_analysis_file(nf)
 
         label_map = {}
         if matching_mode == 'By Coordinates':
@@ -1643,16 +1651,10 @@ class Controller(vkt.Controller):
             if cached_map is not None:
                 label_map = cached_map
             else:
-                ef_bytes = ef.getvalue_binary()
-                nf_bytes = nf.getvalue_binary()
-                wb_e = load_workbook(io.BytesIO(ef_bytes), read_only=True, data_only=True)
-                wb_n = load_workbook(io.BytesIO(nf_bytes), read_only=True, data_only=True)
-                try:
-                    lmap, _ = build_label_map(wb_e, wb_n)
-                finally:
-                    wb_e.close()
-                    wb_n.close()
-                label_map = lmap
+                label_map, _ = build_label_map_from_indices(
+                    parsed_exist.get('coord_index', {}),
+                    parsed_new.get('coord_index', {}),
+                )
                 set_cached('etabs_labelmap', map_cache_key, label_map)
 
         cache_key_extra = (matching_mode, len(label_map))
@@ -1676,6 +1678,14 @@ class Controller(vkt.Controller):
         )
         set_cached('etabs_postv4', key, results)
         return results
+
+    def _run_analysis_all_safe(self, params):
+        try:
+            return self._run_analysis_all(params)
+        except vkt.UserError:
+            raise
+        except Exception:
+            raise vkt.UserError(f'Analysis comparison failed:\n{traceback.format_exc()}')
 
     def _run_typed(self, params, member_type: str) -> list:
         """Filtered + focused results for one member type (typed review tabs).
@@ -1704,9 +1714,9 @@ class Controller(vkt.Controller):
         display_filter     = p.display_filter or 'Failures Only'
 
         all_results = (
-            self._run_analysis_all(params)
+            self._run_analysis_all_safe(params)
             if mode == 'Analysis Results'
-            else self._run_all(params)
+            else self._run_all_safe(params)
         )
 
         singular   = _TYPE_SINGULAR[member_type]
