@@ -194,6 +194,25 @@ def _postprocess_results(results: list) -> list:
     return out
 
 
+def _tag_new_labels(results: list, label_map: dict) -> list:
+    """Add NewLabel (original new-model label) to each result row when coord matching is active."""
+    if not label_map:
+        return results
+    inverse = {v: k for k, v in label_map.items()}
+    out = []
+    for r in results:
+        r = dict(r)
+        pass_val = r.get('Pass', '')
+        if pass_val == 'REMOVED':
+            r['NewLabel'] = 'N/A'
+        elif pass_val == 'ADDED':
+            r['NewLabel'] = r.get('Label', '')
+        else:
+            r['NewLabel'] = inverse.get(r.get('Label', ''), r.get('Label', ''))
+        out.append(r)
+    return out
+
+
 def _recompute_typed_fail_reason(
     r: dict, gov_forces: list, force_thresholds: dict,
     grav_warn: float, grav_fail: float,
@@ -893,51 +912,63 @@ class Controller(vkt.Controller):
             results = self._run_analysis(params)
             if not results:
                 raise vkt.UserError(_no_results_message_analysis(params))
+            has_nl = any('NewLabel' in r for r in results)
+            headers = list(ANALYSIS_OVERVIEW_HEADERS)
+            if has_nl:
+                headers.insert(2, 'New Label')
             data = []
             for r in results:
-                data.append([
-                    r.get('Story', ''),
-                    r.get('Label', ''),
+                row = [r.get('Story', ''), r.get('Label', '')]
+                if has_nl:
+                    row.append(r.get('NewLabel', ''))
+                row += [
                     r.get('MemberType', ''),
-                    r.get('P_New', ''),
-                    _fmt_pct(r.get('P_Pct', '')),
-                    r.get('V2_New', ''),
-                    _fmt_pct(r.get('V2_Pct', '')),
-                    r.get('M2_New', ''),
-                    _fmt_pct(r.get('M2_Pct', '')),
-                    r.get('M3_New', ''),
-                    _fmt_pct(r.get('M3_Pct', '')),
+                    r.get('P_New', ''), _fmt_pct(r.get('P_Pct', '')),
+                    r.get('V2_New', ''), _fmt_pct(r.get('V2_Pct', '')),
+                    r.get('M2_New', ''), _fmt_pct(r.get('M2_Pct', '')),
+                    r.get('M3_New', ''), _fmt_pct(r.get('M3_Pct', '')),
                     _fmt_pct(r.get('WorstPct', '')),
                     r.get('FailReason', ''),
                     _result_cell(r.get('Pass', '')),
-                ])
-            return vkt.TableResult(data, column_headers=ANALYSIS_OVERVIEW_HEADERS)
+                ]
+                data.append(row)
+            return vkt.TableResult(data, column_headers=headers)
+
+        # Defensive: should only reach here if mode is Design Results
+        _detected_mode = params.step1.mode or 'Design Results'
+        if _detected_mode == 'Analysis Results':
+            raise vkt.UserError(
+                f'Internal routing error: mode={_detected_mode!r} reached Design Results path. '
+                f'Please report this. Try refreshing the browser and reloading the page.'
+            )
 
         results = self._run(params)
         if not results:
             raise vkt.UserError(_no_results_message(params))
 
+        has_nl = any('NewLabel' in r for r in results)
+        headers = list(OVERVIEW_HEADERS)
+        if has_nl:
+            headers.insert(2, 'New Label')
         data = []
         for r in results:
-            data.append([
-                r.get('Story', ''),
-                r.get('Label', ''),
+            row = [r.get('Story', ''), r.get('Label', '')]
+            if has_nl:
+                row.append(r.get('NewLabel', ''))
+            row += [
                 r.get('MemberType', ''),
                 r.get('LoadType', ''),
-                r.get('P_New', ''),
-                _fmt_pct(r.get('P_Pct', '')),
-                r.get('V2_New', ''),
-                _fmt_pct(r.get('V2_Pct', '')),
-                r.get('M3_New', ''),
-                _fmt_pct(r.get('M3_Pct', '')),
-                r.get('M2_New', ''),
-                _fmt_pct(r.get('M2_Pct', '')),
+                r.get('P_New', ''), _fmt_pct(r.get('P_Pct', '')),
+                r.get('V2_New', ''), _fmt_pct(r.get('V2_Pct', '')),
+                r.get('M3_New', ''), _fmt_pct(r.get('M3_Pct', '')),
+                r.get('M2_New', ''), _fmt_pct(r.get('M2_Pct', '')),
                 _worst_force_pct(r),
                 r.get('FailReason', ''),
                 _result_cell(r.get('Pass', '')),
-            ])
+            ]
+            data.append(row)
 
-        return vkt.TableResult(data, column_headers=OVERVIEW_HEADERS)
+        return vkt.TableResult(data, column_headers=headers)
 
     # -- Full detail table ---------------------------------------------------
 
@@ -950,11 +981,16 @@ class Controller(vkt.Controller):
             results = self._run_analysis(params)
             if not results:
                 raise vkt.UserError(_no_results_message_analysis(params))
+            has_nl = any('NewLabel' in r for r in results)
+            headers = list(ANALYSIS_DETAIL_HEADERS)
+            if has_nl:
+                headers.insert(2, 'New Label')
             data = []
             for r in results:
-                data.append([
-                    r.get('Story', ''),
-                    r.get('Label', ''),
+                row = [r.get('Story', ''), r.get('Label', '')]
+                if has_nl:
+                    row.append(r.get('NewLabel', ''))
+                row += [
                     r.get('MemberType', ''),
                     r.get('P_Exist', ''), r.get('P_New', ''), _fmt_pct(r.get('P_Pct', '')),
                     r.get('V2_Exist', ''), r.get('V2_New', ''), _fmt_pct(r.get('V2_Pct', '')),
@@ -963,19 +999,25 @@ class Controller(vkt.Controller):
                     _fmt_pct(r.get('WorstPct', '')),
                     r.get('FailReason', ''),
                     _result_cell(r.get('Pass', '')),
-                ])
-            return vkt.TableResult(data, column_headers=ANALYSIS_DETAIL_HEADERS)
+                ]
+                data.append(row)
+            return vkt.TableResult(data, column_headers=headers)
 
         results = self._run(params)
         if not results:
             raise vkt.UserError(_no_results_message(params))
 
+        has_nl = any('NewLabel' in r for r in results)
+        headers = list(DETAIL_HEADERS)
+        if has_nl:
+            headers.insert(2, 'New Label')
         data = []
         for r in results:
             section = r.get('DesignSection_New') or r.get('DesignSection_Exist', '')
-            data.append([
-                r.get('Story', ''),
-                r.get('Label', ''),
+            row = [r.get('Story', ''), r.get('Label', '')]
+            if has_nl:
+                row.append(r.get('NewLabel', ''))
+            row += [
                 r.get('MemberType', ''),
                 section,
                 r.get('GovCombo_New', ''),
@@ -988,9 +1030,10 @@ class Controller(vkt.Controller):
                 r.get('NetDemand', ''),
                 r.get('FailReason', ''),
                 _result_cell(r.get('Pass', '')),
-            ])
+            ]
+            data.append(row)
 
-        return vkt.TableResult(data, column_headers=DETAIL_HEADERS)
+        return vkt.TableResult(data, column_headers=headers)
 
     # -- Summary table -------------------------------------------------------
 
@@ -1203,42 +1246,49 @@ class Controller(vkt.Controller):
                 'threshold, or demand decreased for all. Switch to "All Results" or lower '
                 'the absolute threshold to see the full brace list.'
             )
+        has_nl = any('NewLabel' in r for r in results)
         if mode == 'Analysis Results':
-            headers = [
-                'Story', 'Label', 'Combo (Exist)', 'Combo (New)',
+            headers = ['Story', 'Label'] + (['New Label'] if has_nl else []) + [
+                'Combo (Exist)', 'Combo (New)',
                 'P (Exist)', 'P (New)', 'P (%)',
                 'Worst (%)', 'Flag Reason', 'Result',
             ]
-            col_widths = [90, 80, 180, 180, 85, 85, 75, 85, 180, 70]
+            col_widths = [90, 80] + ([80] if has_nl else []) + [180, 180, 85, 85, 75, 85, 180, 70]
             data = []
             for r in results:
-                data.append([
-                    r.get('Story', ''), r.get('Label', ''),
+                row = [r.get('Story', ''), r.get('Label', '')]
+                if has_nl:
+                    row.append(r.get('NewLabel', ''))
+                row += [
                     r.get('GovCombo_Exist', ''), r.get('GovCombo_New', ''),
                     r.get('P_Exist', ''), r.get('P_New', ''),
                     _fmt_pct(r.get('P_Pct', '')),
                     _fmt_pct(r.get('WorstPct', '')),
                     r.get('FailReason', ''), r.get('Pass', ''),
-                ])
+                ]
+                data.append(row)
         else:
-            headers = [
-                'Story', 'Label', 'Section (Exist)', 'Section (New)',
+            headers = ['Story', 'Label'] + (['New Label'] if has_nl else []) + [
+                'Section (Exist)', 'Section (New)',
                 'Combo (Exist)', 'Combo (New)', 'Load Type',
                 'P (Exist)', 'P (New)', 'P (%)',
                 'Flag Reason', 'Result',
             ]
-            col_widths = [90, 80, 130, 130, 180, 180, 90, 85, 85, 75, 180, 70]
+            col_widths = [90, 80] + ([80] if has_nl else []) + [130, 130, 180, 180, 90, 85, 85, 75, 180, 70]
             data = []
             for r in results:
-                data.append([
-                    r.get('Story', ''), r.get('Label', ''),
+                row = [r.get('Story', ''), r.get('Label', '')]
+                if has_nl:
+                    row.append(r.get('NewLabel', ''))
+                row += [
                     r.get('DesignSection_Exist', ''), r.get('DesignSection_New', ''),
                     r.get('GovCombo_Exist', ''), r.get('GovCombo_New', ''),
                     r.get('LoadType', ''),
                     r.get('P_Exist', ''), r.get('P_New', ''),
                     _fmt_pct(r.get('P_Pct', '')),
                     r.get('FailReason', ''), r.get('Pass', ''),
-                ])
+                ]
+                data.append(row)
         return vkt.WebResult(html=_build_html_table(headers, data, col_widths))
 
     @vkt.WebView('Columns', duration_guess=2)
@@ -1253,54 +1303,55 @@ class Controller(vkt.Controller):
                 'threshold, or demand decreased for all. Switch to "All Results" or lower '
                 'the absolute threshold to see the full column list.'
             )
+        has_nl = any('NewLabel' in r for r in results)
         if mode == 'Analysis Results':
-            headers = [
-                'Story', 'Label', 'Combo (Exist)', 'Combo (New)',
+            headers = ['Story', 'Label'] + (['New Label'] if has_nl else []) + [
+                'Combo (Exist)', 'Combo (New)',
                 'P (Exist)', 'P (New)', 'P (%)',
                 'M3 (Exist)', 'M3 (New)', 'M3 (%)',
                 'M2 (Exist)', 'M2 (New)', 'M2 (%)',
                 'Worst (%)', 'Flag Reason', 'Result',
             ]
-            col_widths = [90, 80, 180, 180, 85, 85, 75, 85, 85, 75, 85, 85, 75, 85, 180, 70]
+            col_widths = [90, 80] + ([80] if has_nl else []) + [180, 180, 85, 85, 75, 85, 85, 75, 85, 85, 75, 85, 180, 70]
             data = []
             for r in results:
-                data.append([
-                    r.get('Story', ''), r.get('Label', ''),
+                row = [r.get('Story', ''), r.get('Label', '')]
+                if has_nl:
+                    row.append(r.get('NewLabel', ''))
+                row += [
                     r.get('GovCombo_Exist', ''), r.get('GovCombo_New', ''),
-                    r.get('P_Exist', ''), r.get('P_New', ''),
-                    _fmt_pct(r.get('P_Pct', '')),
-                    r.get('M3_Exist', ''), r.get('M3_New', ''),
-                    _fmt_pct(r.get('M3_Pct', '')),
-                    r.get('M2_Exist', ''), r.get('M2_New', ''),
-                    _fmt_pct(r.get('M2_Pct', '')),
+                    r.get('P_Exist', ''), r.get('P_New', ''), _fmt_pct(r.get('P_Pct', '')),
+                    r.get('M3_Exist', ''), r.get('M3_New', ''), _fmt_pct(r.get('M3_Pct', '')),
+                    r.get('M2_Exist', ''), r.get('M2_New', ''), _fmt_pct(r.get('M2_Pct', '')),
                     _fmt_pct(r.get('WorstPct', '')),
                     r.get('FailReason', ''), r.get('Pass', ''),
-                ])
+                ]
+                data.append(row)
         else:
-            headers = [
-                'Story', 'Label', 'Section (Exist)', 'Section (New)',
+            headers = ['Story', 'Label'] + (['New Label'] if has_nl else []) + [
+                'Section (Exist)', 'Section (New)',
                 'Combo (Exist)', 'Combo (New)', 'Load Type',
                 'P (Exist)', 'P (New)', 'P (%)',
                 'M3 (Exist)', 'M3 (New)', 'M3 (%)',
                 'M2 (Exist)', 'M2 (New)', 'M2 (%)',
                 'Flag Reason', 'Result',
             ]
-            col_widths = [90, 80, 130, 130, 180, 180, 90, 85, 85, 75, 85, 85, 75, 85, 85, 75, 180, 70]
+            col_widths = [90, 80] + ([80] if has_nl else []) + [130, 130, 180, 180, 90, 85, 85, 75, 85, 85, 75, 85, 85, 75, 180, 70]
             data = []
             for r in results:
-                data.append([
-                    r.get('Story', ''), r.get('Label', ''),
+                row = [r.get('Story', ''), r.get('Label', '')]
+                if has_nl:
+                    row.append(r.get('NewLabel', ''))
+                row += [
                     r.get('DesignSection_Exist', ''), r.get('DesignSection_New', ''),
                     r.get('GovCombo_Exist', ''), r.get('GovCombo_New', ''),
                     r.get('LoadType', ''),
-                    r.get('P_Exist', ''), r.get('P_New', ''),
-                    _fmt_pct(r.get('P_Pct', '')),
-                    r.get('M3_Exist', ''), r.get('M3_New', ''),
-                    _fmt_pct(r.get('M3_Pct', '')),
-                    r.get('M2_Exist', ''), r.get('M2_New', ''),
-                    _fmt_pct(r.get('M2_Pct', '')),
+                    r.get('P_Exist', ''), r.get('P_New', ''), _fmt_pct(r.get('P_Pct', '')),
+                    r.get('M3_Exist', ''), r.get('M3_New', ''), _fmt_pct(r.get('M3_Pct', '')),
+                    r.get('M2_Exist', ''), r.get('M2_New', ''), _fmt_pct(r.get('M2_Pct', '')),
                     r.get('FailReason', ''), r.get('Pass', ''),
-                ])
+                ]
+                data.append(row)
         return vkt.WebResult(html=_build_html_table(headers, data, col_widths))
 
     @vkt.WebView('Beams', duration_guess=2)
@@ -1315,48 +1366,51 @@ class Controller(vkt.Controller):
                 'threshold, or demand decreased for all. Switch to "All Results" or lower '
                 'the absolute threshold to see the full beam list.'
             )
+        has_nl = any('NewLabel' in r for r in results)
         if mode == 'Analysis Results':
-            headers = [
-                'Story', 'Label', 'Combo (Exist)', 'Combo (New)',
+            headers = ['Story', 'Label'] + (['New Label'] if has_nl else []) + [
+                'Combo (Exist)', 'Combo (New)',
                 'M3 (Exist)', 'M3 (New)', 'M3 (%)',
                 'V2 (Exist)', 'V2 (New)', 'V2 (%)',
                 'Worst (%)', 'Flag Reason', 'Result',
             ]
-            col_widths = [90, 80, 180, 180, 85, 85, 75, 85, 85, 75, 85, 180, 70]
+            col_widths = [90, 80] + ([80] if has_nl else []) + [180, 180, 85, 85, 75, 85, 85, 75, 85, 180, 70]
             data = []
             for r in results:
-                data.append([
-                    r.get('Story', ''), r.get('Label', ''),
+                row = [r.get('Story', ''), r.get('Label', '')]
+                if has_nl:
+                    row.append(r.get('NewLabel', ''))
+                row += [
                     r.get('GovCombo_Exist', ''), r.get('GovCombo_New', ''),
-                    r.get('M3_Exist', ''), r.get('M3_New', ''),
-                    _fmt_pct(r.get('M3_Pct', '')),
-                    r.get('V2_Exist', ''), r.get('V2_New', ''),
-                    _fmt_pct(r.get('V2_Pct', '')),
+                    r.get('M3_Exist', ''), r.get('M3_New', ''), _fmt_pct(r.get('M3_Pct', '')),
+                    r.get('V2_Exist', ''), r.get('V2_New', ''), _fmt_pct(r.get('V2_Pct', '')),
                     _fmt_pct(r.get('WorstPct', '')),
                     r.get('FailReason', ''), r.get('Pass', ''),
-                ])
+                ]
+                data.append(row)
         else:
-            headers = [
-                'Story', 'Label', 'Section (Exist)', 'Section (New)',
+            headers = ['Story', 'Label'] + (['New Label'] if has_nl else []) + [
+                'Section (Exist)', 'Section (New)',
                 'Combo (Exist)', 'Combo (New)', 'Load Type',
                 'M3 (Exist)', 'M3 (New)', 'M3 (%)',
                 'V2 (Exist)', 'V2 (New)', 'V2 (%)',
                 'Flag Reason', 'Result',
             ]
-            col_widths = [90, 80, 130, 130, 180, 180, 90, 85, 85, 75, 85, 85, 75, 180, 70]
+            col_widths = [90, 80] + ([80] if has_nl else []) + [130, 130, 180, 180, 90, 85, 85, 75, 85, 85, 75, 180, 70]
             data = []
             for r in results:
-                data.append([
-                    r.get('Story', ''), r.get('Label', ''),
+                row = [r.get('Story', ''), r.get('Label', '')]
+                if has_nl:
+                    row.append(r.get('NewLabel', ''))
+                row += [
                     r.get('DesignSection_Exist', ''), r.get('DesignSection_New', ''),
                     r.get('GovCombo_Exist', ''), r.get('GovCombo_New', ''),
                     r.get('LoadType', ''),
-                    r.get('M3_Exist', ''), r.get('M3_New', ''),
-                    _fmt_pct(r.get('M3_Pct', '')),
-                    r.get('V2_Exist', ''), r.get('V2_New', ''),
-                    _fmt_pct(r.get('V2_Pct', '')),
+                    r.get('M3_Exist', ''), r.get('M3_New', ''), _fmt_pct(r.get('M3_Pct', '')),
+                    r.get('V2_Exist', ''), r.get('V2_New', ''), _fmt_pct(r.get('V2_Pct', '')),
                     r.get('FailReason', ''), r.get('Pass', ''),
-                ])
+                ]
+                data.append(row)
         return vkt.WebResult(html=_build_html_table(headers, data, col_widths))
 
     def _find_worst_beam(self, results: list) -> Optional[dict]:
@@ -1610,7 +1664,7 @@ class Controller(vkt.Controller):
             _parsed_new_override=parsed_new_override,
             _cache_key_extra=cache_key_extra,
         )
-        processed = _postprocess_results(results)
+        processed = _tag_new_labels(_postprocess_results(results), label_map)
         set_cached('etabs_postv4', key, processed)
         return processed
 
@@ -1676,6 +1730,7 @@ class Controller(vkt.Controller):
             _parsed_new_override=parsed_new_override,
             _cache_key_extra=cache_key_extra,
         )
+        results = _tag_new_labels(results, label_map)
         set_cached('etabs_postv4', key, results)
         return results
 

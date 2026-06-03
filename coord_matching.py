@@ -47,6 +47,28 @@ def _snap(v, tol):
     return round(float(v) / tol)
 
 
+def _norm_joint_key(v):
+    """
+    Normalise a joint Element Name to a consistent type for dict lookup.
+
+    ETABS can export joint IDs as int, float (e.g. 101.0), or numeric string
+    ('101').  We canonicalise all whole-number values to int so that
+    joint_coords built in one pass is always looked up with matching key types.
+    """
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v == int(v):
+        return int(v)
+    if isinstance(v, str):
+        try:
+            f = float(v)
+            if f == int(f):
+                return int(f)
+        except (ValueError, TypeError):
+            pass
+    return v
+
+
 def _geom_key(x1, y1, z1, x2, y2, z2, tol):
     """
     Canonical geometry key for a frame element defined by two 3D endpoints.
@@ -89,7 +111,7 @@ def parse_coord_index(wb, tolerance: float = COORD_TOLERANCE) -> dict:
         vals = [c.value for c in row]
         n = len(vals)
         try:
-            ename = vals[ename_i] if ename_i < n else None
+            ename = _norm_joint_key(vals[ename_i] if ename_i < n else None)
             x     = float(vals[x_i]) if x_i < n and vals[x_i] is not None else None
             y     = float(vals[y_i]) if y_i < n and vals[y_i] is not None else None
             z     = float(vals[z_i]) if z_i < n and vals[z_i] is not None else None
@@ -101,7 +123,7 @@ def parse_coord_index(wb, tolerance: float = COORD_TOLERANCE) -> dict:
     if not joint_coords:
         return {}
 
-    # --- parse frames: object_label → geom_key ---
+    # --- parse frames: collect all element endpoints per object label ---
     col_map, rows_iter = _stream_rows(wb[FRAMES_SHEET])
     if col_map is None:
         return {}
@@ -112,20 +134,44 @@ def parse_coord_index(wb, tolerance: float = COORD_TOLERANCE) -> dict:
     if any(v is None for v in (label_i, jti_i, jtj_i)):
         return {}
 
-    result = {}
+    # Each ETABS frame object is divided into ≥1 finite elements.
+    # We need the OBJECT endpoints (I-joint and J-joint of the whole member),
+    # not the per-element joints.  The terminal joints are those that appear
+    # exactly once across all elements of a given frame label — they are the
+    # object endpoints.  Internal (intermediate) joints appear exactly twice.
+    frame_elem_joints: dict = {}   # label → [(jti_key, jtj_key), ...]
     for row in rows_iter:
         vals = [c.value for c in row]
-        n = len(vals)
+        n    = len(vals)
         label = vals[label_i] if label_i < n else None
         jti   = vals[jti_i]   if jti_i   < n else None
         jtj   = vals[jtj_i]   if jtj_i   < n else None
         if label is None or jti is None or jtj is None:
             continue
-        # Element Name from joints may be int or str; normalise to match
-        jti_key = int(jti) if isinstance(jti, float) and jti == int(jti) else jti
-        jtj_key = int(jtj) if isinstance(jtj, float) and jtj == int(jtj) else jtj
-        ci = joint_coords.get(jti_key) or joint_coords.get(str(jti_key))
-        cj = joint_coords.get(jtj_key) or joint_coords.get(str(jtj_key))
+        jti_key = _norm_joint_key(jti)
+        jtj_key = _norm_joint_key(jtj)
+        if label not in frame_elem_joints:
+            frame_elem_joints[label] = []
+        frame_elem_joints[label].append((jti_key, jtj_key))
+
+    result = {}
+    for label, elem_joints in frame_elem_joints.items():
+        if len(elem_joints) == 1:
+            # Single-element frame — use directly
+            jti_key, jtj_key = elem_joints[0]
+        else:
+            # Multi-element frame — find terminal joints (appear exactly once)
+            cnt: dict = {}
+            for jti, jtj in elem_joints:
+                cnt[jti] = cnt.get(jti, 0) + 1
+                cnt[jtj] = cnt.get(jtj, 0) + 1
+            terminal = [j for j, c in cnt.items() if c == 1]
+            if len(terminal) != 2:
+                continue  # ring or degenerate — skip
+            jti_key, jtj_key = terminal[0], terminal[1]
+
+        ci = joint_coords.get(jti_key)
+        cj = joint_coords.get(jtj_key)
         if ci is None or cj is None:
             continue
         result[label] = _geom_key(ci[0], ci[1], ci[2], cj[0], cj[1], cj[2], tolerance)
