@@ -69,6 +69,14 @@ def _norm_joint_key(v):
     return v
 
 
+def _col(col_map, *candidates):
+    """Return the first index found among candidate column names, or None."""
+    for name in candidates:
+        if name in col_map:
+            return col_map[name]
+    return None
+
+
 def _geom_key(x1, y1, z1, x2, y2, z2, tol):
     """
     Canonical geometry key for a frame element defined by two 3D endpoints.
@@ -99,10 +107,12 @@ def parse_coord_index(wb, tolerance: float = COORD_TOLERANCE) -> dict:
     if col_map is None:
         return {}
 
-    ename_i = col_map.get('Element Name')
-    x_i     = col_map.get('Global X')
-    y_i     = col_map.get('Global Y')
-    z_i     = col_map.get('Global Z')
+    # ETABS exports joint element IDs as 'Unique Name' in modern versions,
+    # 'Element Name' in older ones.
+    ename_i = _col(col_map, 'Unique Name', 'Element Name', 'Object Name')
+    x_i     = _col(col_map, 'Global X', 'GlobalX', 'X')
+    y_i     = _col(col_map, 'Global Y', 'GlobalY', 'Y')
+    z_i     = _col(col_map, 'Global Z', 'GlobalZ', 'Z')
     if any(v is None for v in (ename_i, x_i, y_i, z_i)):
         return {}
 
@@ -128,9 +138,9 @@ def parse_coord_index(wb, tolerance: float = COORD_TOLERANCE) -> dict:
     if col_map is None:
         return {}
 
-    label_i = col_map.get('Object Label')
-    jti_i   = col_map.get('Elm JtI')
-    jtj_i   = col_map.get('Elm JtJ')
+    label_i = _col(col_map, 'Object Label', 'Label', 'Frame')
+    jti_i   = _col(col_map, 'Elm JtI', 'Elm Jt I', 'ElemJtI', 'JtI', 'StartJoint', 'I Joint')
+    jtj_i   = _col(col_map, 'Elm JtJ', 'Elm Jt J', 'ElemJtJ', 'JtJ', 'EndJoint',   'J Joint')
     if any(v is None for v in (label_i, jti_i, jtj_i)):
         return {}
 
@@ -143,11 +153,12 @@ def parse_coord_index(wb, tolerance: float = COORD_TOLERANCE) -> dict:
     for row in rows_iter:
         vals = [c.value for c in row]
         n    = len(vals)
-        label = vals[label_i] if label_i < n else None
-        jti   = vals[jti_i]   if jti_i   < n else None
-        jtj   = vals[jtj_i]   if jtj_i   < n else None
-        if label is None or jti is None or jtj is None:
+        label_raw = vals[label_i] if label_i < n else None
+        jti       = vals[jti_i]   if jti_i   < n else None
+        jtj       = vals[jtj_i]   if jtj_i   < n else None
+        if label_raw is None or jti is None or jtj is None:
             continue
+        label = str(label_raw).strip()
         jti_key = _norm_joint_key(jti)
         jtj_key = _norm_joint_key(jtj)
         if label not in frame_elem_joints:
@@ -287,7 +298,10 @@ def apply_label_map(parsed_dict: dict, label_map: dict) -> dict:
             forces_new[mt] = df
             continue
         df2 = df.copy()
-        df2['Label'] = df2['Label'].map(lambda lbl: label_map.get(lbl, lbl))
+        str_map = {str(k).strip(): v for k, v in label_map.items()}
+        df2['Label'] = df2['Label'].map(
+            lambda lbl: str_map.get(str(lbl).strip(), lbl)
+        )
         forces_new[mt] = df2
     result['forces'] = forces_new
 
@@ -295,8 +309,9 @@ def apply_label_map(parsed_dict: dict, label_map: dict) -> dict:
     summary_orig = parsed_dict.get('summary')
     if summary_orig is not None and not summary_orig.empty and 'Label' in summary_orig.columns:
         summary_new = summary_orig.copy()
+        str_map = {str(k).strip(): v for k, v in label_map.items()}
         summary_new['Label'] = summary_new['Label'].map(
-            lambda lbl: label_map.get(lbl, lbl)
+            lambda lbl: str_map.get(str(lbl).strip(), lbl)
         )
         result['summary'] = summary_new
 

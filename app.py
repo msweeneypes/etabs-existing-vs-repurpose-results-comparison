@@ -1633,7 +1633,7 @@ class Controller(vkt.Controller):
         label_map = {}
         if matching_mode == 'By Coordinates':
             map_cache_key = ('labelmap', eh, nh)
-            cached_map = get_cached('etabs_labelmap', map_cache_key)
+            cached_map = get_cached('etabs_labelmapv2', map_cache_key)
             if cached_map is not None:
                 label_map = cached_map
             else:
@@ -1641,12 +1641,35 @@ class Controller(vkt.Controller):
                     parsed_exist.get('coord_index', {}),
                     parsed_new.get('coord_index', {}),
                 )
-                set_cached('etabs_labelmap', map_cache_key, label_map)
+                set_cached('etabs_labelmapv2', map_cache_key, label_map)
+
+        if matching_mode == 'By Coordinates' and not label_map:
+            ei = parsed_exist.get('coord_index', {})
+            ni = parsed_new.get('coord_index', {})
+            if not ei or not ni:
+                missing = []
+                if not ei:
+                    missing.append('existing model')
+                if not ni:
+                    missing.append('modified model')
+                raise vkt.UserError(
+                    f'By Coordinates matching requires "Objects and Elements - Joints" and '
+                    f'"Objects and Elements - Frames" sheets in both exports, but they could not '
+                    f'be parsed from: {", ".join(missing)}.\n\n'
+                    f'Re-export from ETABS including those two tables, or switch to "By Label" matching.'
+                )
+            raise vkt.UserError(
+                f'By Coordinates matching found no geometric matches between the two models '
+                f'({len(ei)} existing elements, {len(ni)} new elements indexed). '
+                f'Possible causes: different coordinate origins between models, units mismatch, '
+                f'or tolerance too tight (current: {0.1} in.). '
+                f'Switch to "By Label" matching if labels are consistent between models.'
+            )
 
         cache_key_extra = (matching_mode, len(label_map))
         key = (eh, nh, grav, lat, grav_warn, lat_warn) + cache_key_extra
 
-        cached = get_cached('etabs_postv4', key)
+        cached = get_cached('etabs_postv5', key)
         if cached is not None:
             return cached
 
@@ -1665,7 +1688,7 @@ class Controller(vkt.Controller):
             _cache_key_extra=cache_key_extra,
         )
         processed = _tag_new_labels(_postprocess_results(results), label_map)
-        set_cached('etabs_postv4', key, processed)
+        set_cached('etabs_postv5', key, processed)
         return processed
 
     def _run_all_safe(self, params):
@@ -1701,7 +1724,7 @@ class Controller(vkt.Controller):
         label_map = {}
         if matching_mode == 'By Coordinates':
             map_cache_key = ('labelmap', eh, nh)
-            cached_map = get_cached('etabs_labelmap', map_cache_key)
+            cached_map = get_cached('etabs_labelmapv2', map_cache_key)
             if cached_map is not None:
                 label_map = cached_map
             else:
@@ -1709,12 +1732,35 @@ class Controller(vkt.Controller):
                     parsed_exist.get('coord_index', {}),
                     parsed_new.get('coord_index', {}),
                 )
-                set_cached('etabs_labelmap', map_cache_key, label_map)
+                set_cached('etabs_labelmapv2', map_cache_key, label_map)
+
+        if matching_mode == 'By Coordinates' and not label_map:
+            ei = parsed_exist.get('coord_index', {})
+            ni = parsed_new.get('coord_index', {})
+            if not ei or not ni:
+                missing = []
+                if not ei:
+                    missing.append('existing model')
+                if not ni:
+                    missing.append('modified model')
+                raise vkt.UserError(
+                    f'By Coordinates matching requires "Objects and Elements - Joints" and '
+                    f'"Objects and Elements - Frames" sheets in both exports, but they could not '
+                    f'be parsed from: {", ".join(missing)}.\n\n'
+                    f'Re-export from ETABS including those two tables, or switch to "By Label" matching.'
+                )
+            raise vkt.UserError(
+                f'By Coordinates matching found no geometric matches between the two models '
+                f'({len(ei)} existing elements, {len(ni)} new elements indexed). '
+                f'Possible causes: different coordinate origins between models, units mismatch, '
+                f'or tolerance too tight (current: {0.1} in.). '
+                f'Switch to "By Label" matching if labels are consistent between models.'
+            )
 
         cache_key_extra = (matching_mode, len(label_map))
         key  = (eh, nh, warn, fail, 'analysis') + cache_key_extra
 
-        cached = get_cached('etabs_postv4', key)
+        cached = get_cached('etabs_postv5', key)
         if cached is not None:
             return cached
 
@@ -1731,7 +1777,7 @@ class Controller(vkt.Controller):
             _cache_key_extra=cache_key_extra,
         )
         results = _tag_new_labels(results, label_map)
-        set_cached('etabs_postv4', key, results)
+        set_cached('etabs_postv5', key, results)
         return results
 
     def _run_analysis_all_safe(self, params):

@@ -121,7 +121,7 @@ def _get_parsed_analysis_file(file_obj) -> tuple:
     file_bytes = file_obj.getvalue_binary()
     h = hashlib.md5(file_bytes).hexdigest()
 
-    cached = get_cached('etabs_aparsev4', h)
+    cached = get_cached('etabs_aparsev5', h)
     if cached is not None:
         return h, cached
 
@@ -150,7 +150,7 @@ def _get_parsed_analysis_file(file_obj) -> tuple:
             'coord_index': {},
         }
 
-    set_cached('etabs_aparsev4', h, result)
+    set_cached('etabs_aparsev5', h, result)
     return h, result
 
 
