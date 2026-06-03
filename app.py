@@ -1483,7 +1483,7 @@ class Controller(vkt.Controller):
             return float(pct) if isinstance(pct, float) else -1.0
 
         if mode == 'Analysis Results':
-            all_results = self._run_analysis_all(params)
+            all_results = self._run_analysis_all_safe(params)
             flags       = sorted(
                 [r for r in all_results if r.get('Pass') == 'FLAG'],
                 key=_severity, reverse=True,
@@ -1522,7 +1522,7 @@ class Controller(vkt.Controller):
                 f"If asked about a member not listed, note it is passing."
             )
         else:
-            all_results = self._run_all(params)
+            all_results = self._run_all_safe(params)
             flags          = sorted(
                 [r for r in all_results if r.get('Pass') == 'FLAG'],
                 key=_severity, reverse=True,

@@ -127,6 +127,7 @@ def _parse_forces_from_wb(wb, member_type: str) -> pd.DataFrame:
         label = vals[label_i] if label_i < n else None
         if story is None or label is None:
             continue
+        label = str(label).strip()
         output_case = (
             str(vals[output_case_i])
             if output_case_i is not None and output_case_i < n and vals[output_case_i] is not None
@@ -190,6 +191,7 @@ def _parse_one_summary_sheet(ws) -> pd.DataFrame:
         label = vals[label_i] if label_i < n else None
         if story is None or label is None:
             continue
+        label = str(label).strip()
         row_dict = {'Story': story, 'Label': label}
         for field in extra_fields:
             fi = idx.get(field)
