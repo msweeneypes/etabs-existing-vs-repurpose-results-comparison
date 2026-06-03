@@ -1,8 +1,10 @@
+import io
 import re
 from typing import Optional
 
 import viktor as vkt
 from openai import OpenAI
+from openpyxl import load_workbook
 
 _llm_client = OpenAI(
     base_url=vkt.ViktorOpenAI.get_base_url(version="v1"),
@@ -342,6 +344,16 @@ near-instant.
         options=['Design Results', 'Analysis Results'],
         default='Design Results',
         description='Match this to the ETABS tables you exported',
+    )
+
+    step1.matching_mode = vkt.OptionField(
+        'Element Matching Mode',
+        options=['By Label', 'By Coordinates'],
+        default='By Label',
+        description=(
+            'By Coordinates matches on 3D joint geometry — use when labels differ '
+            'between models. Requires Joints and Frames sheets in both exports.'
+        ),
     )
 
     step1.existing_file = vkt.FileField(
@@ -1542,6 +1554,8 @@ class Controller(vkt.Controller):
         Reduces cold-worker Storage reads from 3 (parse×2 + cmp) down to 1
         for every view after the first call with a given file+threshold combo.
         """
+        from coord_matching import apply_label_map, build_label_map
+
         p         = params.step2.section_options
         grav      = float(p.gravity_threshold      or 5)
         lat       = float(p.lateral_threshold      or 10)
@@ -1549,15 +1563,40 @@ class Controller(vkt.Controller):
         lat_warn  = float(p.lateral_warn_threshold or 5)
         ef = params.step1.existing_file.file
         nf = params.step1.modified_file.file
+        matching_mode = getattr(params.step1, 'matching_mode', None) or 'By Label'
+
         # _get_parsed_file downloads + parses once and warms _MEMORY so
         # run_comparison's internal _get_parsed_file call is a free cache hit.
-        eh, _ = _get_parsed_file(ef)
-        nh, _ = _get_parsed_file(nf)
-        key = (eh, nh, grav, lat, grav_warn, lat_warn)
+        eh, _          = _get_parsed_file(ef)
+        nh, parsed_new = _get_parsed_file(nf)
+
+        label_map = {}
+        if matching_mode == 'By Coordinates':
+            map_cache_key = ('labelmap', eh, nh)
+            cached_map = get_cached('etabs_labelmap', map_cache_key)
+            if cached_map is not None:
+                label_map = cached_map
+            else:
+                ef_bytes = ef.getvalue_binary()
+                nf_bytes = nf.getvalue_binary()
+                wb_e = load_workbook(io.BytesIO(ef_bytes), read_only=True, data_only=True)
+                wb_n = load_workbook(io.BytesIO(nf_bytes), read_only=True, data_only=True)
+                try:
+                    lmap, _ = build_label_map(wb_e, wb_n)
+                finally:
+                    wb_e.close()
+                    wb_n.close()
+                label_map = lmap
+                set_cached('etabs_labelmap', map_cache_key, label_map)
+
+        cache_key_extra = (matching_mode, len(label_map))
+        key = (eh, nh, grav, lat, grav_warn, lat_warn) + cache_key_extra
 
         cached = get_cached('etabs_postv4', key)
         if cached is not None:
             return cached
+
+        parsed_new_override = apply_label_map(parsed_new, label_map) if label_map else None
 
         results = run_comparison(
             existing_file=ef,
@@ -1568,6 +1607,8 @@ class Controller(vkt.Controller):
             gravity_warn_threshold=grav_warn,
             lateral_warn_threshold=lat_warn,
             show_failures_only=False,
+            _parsed_new_override=parsed_new_override,
+            _cache_key_extra=cache_key_extra,
         )
         processed = _postprocess_results(results)
         set_cached('etabs_postv4', key, processed)
@@ -1582,19 +1623,46 @@ class Controller(vkt.Controller):
 
     def _run_analysis_all(self, params):
         """Unfiltered analysis results, cached at the postprocess level."""
+        from analysis_comparison import _get_parsed_analysis_file
+        from coord_matching import apply_label_map, build_label_map
+
         p    = params.step2.section_options
         warn = float(p.warn_threshold or 5)
         fail = float(p.fail_threshold or 10)
         ef   = params.step1.existing_file.file
         nf   = params.step1.modified_file.file
-        from analysis_comparison import _get_parsed_analysis_file
-        eh, _ = _get_parsed_analysis_file(ef)
-        nh, _ = _get_parsed_analysis_file(nf)
-        key  = (eh, nh, warn, fail, 'analysis')
+        matching_mode = getattr(params.step1, 'matching_mode', None) or 'By Label'
+
+        eh, _          = _get_parsed_analysis_file(ef)
+        nh, parsed_new = _get_parsed_analysis_file(nf)
+
+        label_map = {}
+        if matching_mode == 'By Coordinates':
+            map_cache_key = ('labelmap', eh, nh)
+            cached_map = get_cached('etabs_labelmap', map_cache_key)
+            if cached_map is not None:
+                label_map = cached_map
+            else:
+                ef_bytes = ef.getvalue_binary()
+                nf_bytes = nf.getvalue_binary()
+                wb_e = load_workbook(io.BytesIO(ef_bytes), read_only=True, data_only=True)
+                wb_n = load_workbook(io.BytesIO(nf_bytes), read_only=True, data_only=True)
+                try:
+                    lmap, _ = build_label_map(wb_e, wb_n)
+                finally:
+                    wb_e.close()
+                    wb_n.close()
+                label_map = lmap
+                set_cached('etabs_labelmap', map_cache_key, label_map)
+
+        cache_key_extra = (matching_mode, len(label_map))
+        key  = (eh, nh, warn, fail, 'analysis') + cache_key_extra
 
         cached = get_cached('etabs_postv4', key)
         if cached is not None:
             return cached
+
+        parsed_new_override = apply_label_map(parsed_new, label_map) if label_map else None
 
         results = run_analysis_comparison(
             existing_file=ef,
@@ -1603,6 +1671,8 @@ class Controller(vkt.Controller):
             warn_threshold=warn,
             fail_threshold=fail,
             show_failures_only=False,
+            _parsed_new_override=parsed_new_override,
+            _cache_key_extra=cache_key_extra,
         )
         set_cached('etabs_postv4', key, results)
         return results

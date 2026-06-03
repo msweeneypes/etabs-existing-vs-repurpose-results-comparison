@@ -304,6 +304,8 @@ def run_analysis_comparison(
     warn_threshold: float,
     fail_threshold: float,
     show_failures_only: bool,
+    _parsed_new_override: dict = None,
+    _cache_key_extra: tuple = (),
 ) -> list:
     """
     Compare ETABS element force envelopes between two models.
@@ -311,10 +313,17 @@ def run_analysis_comparison(
     Returns one row per member. Keys per row: Story, Label, MemberType,
     P/V2/M2/M3_Exist/New/Pct (governing forces only; others N/A),
     WorstPct, FailReason, Pass.
+
+    _parsed_new_override: pre-processed parsed_dict for the new model (e.g. with
+        labels remapped for coordinate matching). When None the default parse is used.
+    _cache_key_extra: additional tuple components appended to the cache key so
+        different matching modes produce separate cache entries.
     """
     exist_hash, parsed_exist = _get_parsed_analysis_file(existing_file)
     new_hash,   parsed_new   = _get_parsed_analysis_file(modified_file)
-    cache_key = (exist_hash, new_hash, member_type_filter, warn_threshold, fail_threshold)
+    if _parsed_new_override is not None:
+        parsed_new = _parsed_new_override
+    cache_key = (exist_hash, new_hash, member_type_filter, warn_threshold, fail_threshold) + _cache_key_extra
 
     all_results = get_cached('etabs_acmpv3', cache_key)
     if all_results is None:

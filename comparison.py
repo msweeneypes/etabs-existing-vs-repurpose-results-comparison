@@ -714,6 +714,8 @@ def run_comparison(
     gravity_warn_threshold: float = 2.5,
     lateral_warn_threshold: float = 5.0,
     show_failures_only: bool = False,
+    _parsed_new_override: dict = None,
+    _cache_key_extra: tuple = (),
 ) -> list:
     """
     Compare ETABS design output between two models.
@@ -725,12 +727,19 @@ def run_comparison(
     Keys per row: Story, Label, MemberType, DesignSection_Exist/New,
     GovCombo_Exist/New, LoadType, P/V2/V3/T/M2/M3_Exist/New/Pct,
     PMM_Exist/New/Pct, VMaj_Exist/New/Pct, SignReversal, FailReason, Pass
+
+    _parsed_new_override: pre-processed parsed_dict for the new model (e.g. with
+        labels remapped for coordinate matching). When None the default parse is used.
+    _cache_key_extra: additional tuple components appended to the cache key so
+        different matching modes produce separate cache entries.
     """
     exist_hash, parsed_exist = _get_parsed_file(existing_file)
     new_hash,   parsed_new   = _get_parsed_file(modified_file)
+    if _parsed_new_override is not None:
+        parsed_new = _parsed_new_override
     cache_key  = (exist_hash, new_hash, member_type_filter,
                   gravity_threshold, lateral_threshold,
-                  gravity_warn_threshold, lateral_warn_threshold)
+                  gravity_warn_threshold, lateral_warn_threshold) + _cache_key_extra
 
     all_results = get_cached('etabs_cmpv4', cache_key)
     if all_results is None:
